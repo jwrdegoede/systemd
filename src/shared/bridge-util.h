@@ -1,10 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <netinet/in.h>
 #include <linux/if_bridge.h>
 
-#include "conf-parser.h"
+#include "shared-forward.h"
 
 typedef enum BridgeState {
         NETDEV_BRIDGE_STATE_DISABLED   = BR_STATE_DISABLED,
@@ -13,8 +12,7 @@ typedef enum BridgeState {
         NETDEV_BRIDGE_STATE_FORWARDING = BR_STATE_FORWARDING,
         NETDEV_BRIDGE_STATE_BLOCKING   = BR_STATE_BLOCKING,
         _NETDEV_BRIDGE_STATE_MAX,
-        _NETDEV_BRIDGE_STATE_INVALID      = -1,
+        _NETDEV_BRIDGE_STATE_INVALID   = -EINVAL,
 } BridgeState;
 
-const char *bridge_state_to_string(BridgeState d) _const_;
-BridgeState bridge_state_from_string(const char *d) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(bridge_state, BridgeState);

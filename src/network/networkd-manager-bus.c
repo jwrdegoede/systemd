@@ -1,21 +1,25 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <net/if.h>
-#include <netinet/in.h>
-#include <sys/capability.h>
+#include <sys/stat.h>
+
+#include "sd-bus.h"
 
 #include "alloc-util.h"
 #include "bus-common-errors.h"
 #include "bus-message-util.h"
+#include "bus-object.h"
 #include "bus-polkit.h"
-#include "networkd-link-bus.h"
+#include "hashmap.h"
+#include "networkd-dhcp-server-bus.h"
+#include "networkd-dhcp4-bus.h"
+#include "networkd-dhcp6-bus.h"
+#include "networkd-json.h"
 #include "networkd-link.h"
-#include "networkd-manager-bus.h"
+#include "networkd-link-bus.h"
 #include "networkd-manager.h"
+#include "networkd-manager-bus.h"
+#include "networkd-network-bus.h"
 #include "path-util.h"
-#include "socket-netlink.h"
-#include "strv.h"
-#include "user-util.h"
 
 static int method_list_links(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
@@ -31,7 +35,7 @@ static int method_list_links(sd_bus_message *message, void *userdata, sd_bus_err
         if (r < 0)
                 return r;
 
-        HASHMAP_FOREACH(link, manager->links) {
+        HASHMAP_FOREACH(link, manager->links_by_index) {
                 _cleanup_free_ char *path = NULL;
 
                 path = link_bus_path(link);
@@ -51,7 +55,7 @@ static int method_list_links(sd_bus_message *message, void *userdata, sd_bus_err
         if (r < 0)
                 return r;
 
-        return sd_bus_send(NULL, reply, NULL);
+        return sd_bus_message_send(reply);
 }
 
 static int method_get_link_by_name(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -59,19 +63,14 @@ static int method_get_link_by_name(sd_bus_message *message, void *userdata, sd_b
         _cleanup_free_ char *path = NULL;
         Manager *manager = userdata;
         const char *name;
-        int index, r;
         Link *link;
+        int r;
 
         r = sd_bus_message_read(message, "s", &name);
         if (r < 0)
                 return r;
 
-        index = resolve_ifname(&manager->rtnl, name);
-        if (index < 0)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_LINK, "Link %s cannot be resolved", name);
-
-        link = hashmap_get(manager->links, INT_TO_PTR(index));
-        if (!link)
+        if (link_get_by_name(manager, name, &link) < 0)
                 return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_LINK, "Link %s not known", name);
 
         r = sd_bus_message_new_method_return(message, &reply);
@@ -86,7 +85,7 @@ static int method_get_link_by_name(sd_bus_message *message, void *userdata, sd_b
         if (r < 0)
                 return r;
 
-        return sd_bus_send(NULL, reply, NULL);
+        return sd_bus_message_send(reply);
 }
 
 static int method_get_link_by_index(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -100,8 +99,8 @@ static int method_get_link_by_index(sd_bus_message *message, void *userdata, sd_
         if (r < 0)
                 return r;
 
-        link = hashmap_get(manager->links, INT_TO_PTR(ifindex));
-        if (!link)
+        r = link_get_by_index(manager, ifindex, &link);
+        if (r < 0)
                 return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_LINK, "Link %i not known", ifindex);
 
         r = sd_bus_message_new_method_return(message, &reply);
@@ -116,7 +115,7 @@ static int method_get_link_by_index(sd_bus_message *message, void *userdata, sd_
         if (r < 0)
                 return r;
 
-        return sd_bus_send(NULL, reply, NULL);
+        return sd_bus_message_send(reply);
 }
 
 static int call_link_method(Manager *m, sd_bus_message *message, sd_bus_message_handler_t handler, sd_bus_error *error) {
@@ -131,8 +130,8 @@ static int call_link_method(Manager *m, sd_bus_message *message, sd_bus_message_
         if (r < 0)
                 return r;
 
-        l = hashmap_get(m->links, INT_TO_PTR(ifindex));
-        if (!l)
+        r = link_get_by_index(m, ifindex, &l);
+        if (r < 0)
                 return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_LINK, "Link %i not known", ifindex);
 
         return handler(message, l, error);
@@ -199,62 +198,235 @@ static int bus_method_reconfigure_link(sd_bus_message *message, void *userdata, 
 }
 
 static int bus_method_reload(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Manager *manager = userdata;
-        Link *link;
+        Manager *manager = ASSERT_PTR(userdata);
         int r;
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.reload",
-                                    NULL, true, UID_INVALID,
-                                    &manager->polkit_registry, error);
+        if (manager->reloading > 0)
+                return sd_bus_error_set(error, BUS_ERROR_NETWORK_ALREADY_RELOADING, "Already reloading.");
+
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.reload",
+                        /* details= */ NULL,
+                        &manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
                 return 1; /* Polkit will call us back */
 
-        r = netdev_load(manager, true);
+        r = manager_reload(manager, message);
         if (r < 0)
                 return r;
 
-        r = network_reload(manager);
-        if (r < 0)
-                return r;
-
-        HASHMAP_FOREACH(link, manager->links) {
-                r = link_reconfigure(link, false);
-                if (r < 0)
-                        return r;
-        }
+        if (manager->reloading > 0)
+                return 1; /* Will reply later. */
 
         return sd_bus_reply_method_return(message, NULL);
 }
 
-const sd_bus_vtable manager_vtable[] = {
+static int bus_method_describe_link(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        return call_link_method(userdata, message, bus_link_method_describe, error);
+}
+
+static int bus_method_describe(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        _cleanup_free_ char *text = NULL;
+        Manager *manager = ASSERT_PTR(userdata);
+        int r;
+
+        assert(message);
+
+        r = manager_build_json(manager, &v);
+        if (r < 0)
+                return log_error_errno(r, "Failed to build JSON data: %m");
+
+        r = sd_json_variant_format(v, 0, &text);
+        if (r < 0)
+                return log_error_errno(r, "Failed to format JSON data: %m");
+
+        r = sd_bus_message_new_method_return(message, &reply);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_append(reply, "s", text);
+        if (r < 0)
+                return r;
+
+        return sd_bus_message_send(reply);
+}
+
+static int property_get_namespace_id(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        uint64_t id = 0;
+        struct stat st;
+
+        assert(bus);
+        assert(reply);
+
+        /* Returns our own network namespace ID, i.e. the inode number of /proc/self/ns/net. This allows
+         * unprivileged clients to determine whether they are in the same network namespace as us (note that
+         * access to that path is restricted, thus they can't check directly unless privileged). */
+
+        if (stat("/proc/self/ns/net", &st) < 0) {
+                log_warning_errno(errno, "Failed to stat network namespace, ignoring: %m");
+                id = 0;
+        } else
+                id = st.st_ino;
+
+        return sd_bus_message_append(reply, "t", id);
+}
+
+static int property_get_namespace_nsid(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        uint32_t nsid = UINT32_MAX;
+        int r;
+
+        assert(bus);
+        assert(reply);
+
+        /* Returns our own "nsid", which is another ID for the network namespace, different from the inode
+         * number. */
+
+        r = netns_get_nsid(/* netnsfd= */ -EBADF, &nsid);
+        if (r < 0 && r != -ENODATA)
+                log_warning_errno(r, "Failed to query network nsid, ignoring: %m");
+
+        return sd_bus_message_append(reply, "u", nsid);
+}
+
+static const sd_bus_vtable manager_vtable[] = {
         SD_BUS_VTABLE_START(0),
 
         SD_BUS_PROPERTY("OperationalState", "s", property_get_operational_state, offsetof(Manager, operational_state), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("CarrierState", "s", property_get_carrier_state, offsetof(Manager, carrier_state), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("AddressState", "s", property_get_address_state, offsetof(Manager, address_state), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("IPv4AddressState", "s", property_get_address_state, offsetof(Manager, ipv4_address_state), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("IPv6AddressState", "s", property_get_address_state, offsetof(Manager, ipv6_address_state), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("OnlineState", "s", property_get_online_state, offsetof(Manager, online_state), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("NamespaceId", "t", property_get_namespace_id, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("NamespaceNSID", "u", property_get_namespace_nsid, 0, 0),
 
-        SD_BUS_METHOD("ListLinks", NULL, "a(iso)", method_list_links, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("GetLinkByName", "s", "io", method_get_link_by_name, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("GetLinkByIndex", "i", "so", method_get_link_by_index, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetLinkNTP", "ias", NULL, bus_method_set_link_ntp_servers, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetLinkDNS", "ia(iay)", NULL, bus_method_set_link_dns_servers, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetLinkDNSEx", "ia(iayqs)", NULL, bus_method_set_link_dns_servers_ex, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetLinkDomains", "ia(sb)", NULL, bus_method_set_link_domains, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetLinkDefaultRoute", "ib", NULL, bus_method_set_link_default_route, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetLinkLLMNR", "is", NULL, bus_method_set_link_llmnr, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetLinkMulticastDNS", "is", NULL, bus_method_set_link_mdns, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetLinkDNSOverTLS", "is", NULL, bus_method_set_link_dns_over_tls, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetLinkDNSSEC", "is", NULL, bus_method_set_link_dnssec, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetLinkDNSSECNegativeTrustAnchors", "ias", NULL, bus_method_set_link_dnssec_negative_trust_anchors, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("RevertLinkNTP", "i", NULL, bus_method_revert_link_ntp, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("RevertLinkDNS", "i", NULL, bus_method_revert_link_dns, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("RenewLink", "i", NULL, bus_method_renew_link, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("ForceRenewLink", "i", NULL, bus_method_force_renew_link, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("ReconfigureLink", "i", NULL, bus_method_reconfigure_link, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("Reload", NULL, NULL, bus_method_reload, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("ListLinks",
+                                SD_BUS_NO_ARGS,
+                                SD_BUS_RESULT("a(iso)", links),
+                                method_list_links,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("GetLinkByName",
+                                SD_BUS_ARGS("s", name),
+                                SD_BUS_RESULT("i", ifindex, "o", path),
+                                method_get_link_by_name,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("GetLinkByIndex",
+                                SD_BUS_ARGS("i", ifindex),
+                                SD_BUS_RESULT("s", name, "o", path),
+                                method_get_link_by_index,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("SetLinkNTP",
+                                SD_BUS_ARGS("i", ifindex, "as", servers),
+                                SD_BUS_NO_RESULT,
+                                bus_method_set_link_ntp_servers,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("SetLinkDNS",
+                                SD_BUS_ARGS("i", ifindex, "a(iay)", addresses),
+                                SD_BUS_NO_RESULT,
+                                bus_method_set_link_dns_servers,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("SetLinkDNSEx",
+                                SD_BUS_ARGS("i", ifindex, "a(iayqs)", addresses),
+                                SD_BUS_NO_RESULT,
+                                bus_method_set_link_dns_servers_ex,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("SetLinkDomains",
+                                SD_BUS_ARGS("i", ifindex, "a(sb)", domains),
+                                SD_BUS_NO_RESULT,
+                                bus_method_set_link_domains,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("SetLinkDefaultRoute",
+                                SD_BUS_ARGS("i", ifindex, "b", enable),
+                                SD_BUS_NO_RESULT,
+                                bus_method_set_link_default_route,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("SetLinkLLMNR",
+                                SD_BUS_ARGS("i", ifindex, "s", mode),
+                                SD_BUS_NO_RESULT,
+                                bus_method_set_link_llmnr,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("SetLinkMulticastDNS",
+                                SD_BUS_ARGS("i", ifindex, "s", mode),
+                                SD_BUS_NO_RESULT,
+                                bus_method_set_link_mdns,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("SetLinkDNSOverTLS",
+                                SD_BUS_ARGS("i", ifindex, "s", mode),
+                                SD_BUS_NO_RESULT,
+                                bus_method_set_link_dns_over_tls,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("SetLinkDNSSEC",
+                                SD_BUS_ARGS("i", ifindex, "s", mode),
+                                SD_BUS_NO_RESULT,
+                                bus_method_set_link_dnssec,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("SetLinkDNSSECNegativeTrustAnchors",
+                                SD_BUS_ARGS("i", ifindex, "as", names),
+                                SD_BUS_NO_RESULT,
+                                bus_method_set_link_dnssec_negative_trust_anchors,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("RevertLinkNTP",
+                                SD_BUS_ARGS("i", ifindex),
+                                SD_BUS_NO_RESULT,
+                                bus_method_revert_link_ntp,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("RevertLinkDNS",
+                                SD_BUS_ARGS("i", ifindex),
+                                SD_BUS_NO_RESULT,
+                                bus_method_revert_link_dns,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("RenewLink",
+                                SD_BUS_ARGS("i", ifindex),
+                                SD_BUS_NO_RESULT,
+                                bus_method_renew_link,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("ForceRenewLink",
+                                SD_BUS_ARGS("i", ifindex),
+                                SD_BUS_NO_RESULT,
+                                bus_method_force_renew_link,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("ReconfigureLink",
+                                SD_BUS_ARGS("i", ifindex),
+                                SD_BUS_NO_RESULT,
+                                bus_method_reconfigure_link,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("Reload",
+                                SD_BUS_NO_ARGS,
+                                SD_BUS_NO_RESULT,
+                                bus_method_reload,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("DescribeLink",
+                                SD_BUS_ARGS("i", ifindex),
+                                SD_BUS_RESULT("s", json),
+                                bus_method_describe_link,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("Describe",
+                                SD_BUS_NO_ARGS,
+                                SD_BUS_RESULT("s", json),
+                                bus_method_describe,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
 
         SD_BUS_VTABLE_END
 };
@@ -263,7 +435,7 @@ int manager_send_changed_strv(Manager *manager, char **properties) {
         assert(manager);
         assert(properties);
 
-        if (!manager->bus)
+        if (sd_bus_is_ready(manager->bus) <= 0)
                 return 0;
 
         return sd_bus_emit_properties_changed_strv(
@@ -272,3 +444,16 @@ int manager_send_changed_strv(Manager *manager, char **properties) {
                         "org.freedesktop.network1.Manager",
                         properties);
 }
+
+const BusObjectImplementation manager_object = {
+        "/org/freedesktop/network1",
+        "org.freedesktop.network1.Manager",
+        .vtables = BUS_VTABLES(manager_vtable),
+        .children = BUS_IMPLEMENTATIONS(
+                        &link_object, /* This is the main implementation for /org/freedesktop/network1/link,
+                                       * and must be earlier than the dhcp objects below. */
+                        &dhcp_server_object,
+                        &dhcp_client_object,
+                        &dhcp6_client_object,
+                        &network_object),
+};

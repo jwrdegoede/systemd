@@ -8,12 +8,14 @@
 #  (at your option) any later version.
 
 [Unit]
-Description=Halt
+Description=System Halt
 Documentation=man:systemd.special(7)
 DefaultDependencies=no
 Requires=systemd-halt.service
 After=systemd-halt.service
 AllowIsolate=yes
+JobTimeoutSec=30min
+JobTimeoutAction=halt-force
 
 [Install]
 Alias=ctrl-alt-del.target

@@ -6,7 +6,6 @@
 #include <sched.h>
 
 #include "all-units.h"
-#include "macro.h"
 #include "manager.h"
 #include "rm-rf.h"
 #include "tests.h"
@@ -14,7 +13,7 @@
 int main(int argc, char *argv[]) {
         _cleanup_(rm_rf_physical_and_freep) char *runtime_dir = NULL;
         _cleanup_(manager_freep) Manager *m = NULL;
-        Unit *idle_ok, *idle_bad, *rr_ok, *rr_bad, *rr_sched;
+        Unit *idle_ok, *idle_bad, *rr_ok, *rr_bad, *rr_sched, *ext_ok;
         Service *ser;
         int r;
 
@@ -26,15 +25,15 @@ int main(int argc, char *argv[]) {
 
         /* prepare the test */
         _cleanup_free_ char *unit_dir = NULL;
-        assert_se(get_testdata_dir("units", &unit_dir) >= 0);
-        assert_se(set_unit_path(unit_dir) >= 0);
+        ASSERT_OK(get_testdata_dir("test-sched-prio", &unit_dir));
+        ASSERT_OK(setenv_unit_path(unit_dir));
         assert_se(runtime_dir = setup_fake_runtime_dir());
 
-        r = manager_new(UNIT_FILE_USER, MANAGER_TEST_RUN_BASIC, &m);
+        r = manager_new(RUNTIME_SCOPE_USER, MANAGER_TEST_RUN_BASIC, &m);
         if (manager_errno_skip_test(r))
                 return log_tests_skipped_errno(r, "manager_new");
         assert_se(r >= 0);
-        assert_se(manager_startup(m, NULL, NULL) >= 0);
+        assert_se(manager_startup(m, NULL, NULL, NULL) >= 0);
 
         /* load idle ok */
         assert_se(manager_load_startable_unit_or_warn(m, "sched_idle_ok.service", NULL, &idle_ok) >= 0);
@@ -76,6 +75,12 @@ int main(int argc, char *argv[]) {
         ser = SERVICE(rr_sched);
         assert_se(ser->exec_context.cpu_sched_policy == SCHED_RR);
         assert_se(ser->exec_context.cpu_sched_priority == 99);
+
+        /* load ext ok */
+        assert_se(manager_load_startable_unit_or_warn(m, "sched_ext_ok.service", NULL, &ext_ok) >= 0);
+        ser = SERVICE(ext_ok);
+        assert_se(ser->exec_context.cpu_sched_policy == SCHED_EXT);
+        assert_se(ser->exec_context.cpu_sched_priority == 0);
 
         return EXIT_SUCCESS;
 }

@@ -1,28 +1,38 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <netinet/in.h>
 #include <sys/stat.h>
-#include <sys/types.h>
+#include <unistd.h>
 
-#include "sd-daemon.h"
 #include "sd-event.h"
 
+#include "bus-log-control-api.h"
+#include "bus-object.h"
 #include "capability-util.h"
 #include "daemon-util.h"
-#include "firewall-util.h"
 #include "main-func.h"
-#include "mkdir.h"
+#include "mkdir-label.h"
 #include "networkd-conf.h"
 #include "networkd-manager.h"
-#include "signal-util.h"
+#include "networkd-manager-bus.h"
+#include "networkd-serialize.h"
+#include "service-util.h"
+#include "strv.h"
 #include "user-util.h"
 
 static int run(int argc, char *argv[]) {
         _cleanup_(manager_freep) Manager *m = NULL;
-        _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
+        _unused_ _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         int r;
 
-        log_setup_service();
+        log_setup();
+
+        r = service_parse_argv("systemd-networkd.service",
+                               "Manage and configure network devices, create virtual network devices",
+                               BUS_IMPLEMENTATIONS(&manager_object, &log_control_object),
+                               /* runtime_scope= */ NULL,
+                               argc, argv);
+        if (r <= 0)
+                return r;
 
         umask(0022);
 
@@ -51,35 +61,31 @@ static int run(int argc, char *argv[]) {
                                     (1ULL << CAP_NET_ADMIN) |
                                     (1ULL << CAP_NET_BIND_SERVICE) |
                                     (1ULL << CAP_NET_BROADCAST) |
-                                    (1ULL << CAP_NET_RAW));
+                                    (1ULL << CAP_NET_RAW) |
+                                    (1ULL << CAP_SYS_ADMIN) |
+                                    (1ULL << CAP_BPF));
                 if (r < 0)
                         return log_error_errno(r, "Failed to drop privileges: %m");
         }
 
-        /* Always create the directories people can create inotify watches in.
-         * It is necessary to create the following subdirectories after drop_privileges()
-         * to support old kernels not supporting AmbientCapabilities=. */
-        r = mkdir_safe_label("/run/systemd/netif/links", 0755, UID_INVALID, GID_INVALID, MKDIR_WARN_MODE);
-        if (r < 0)
-                log_warning_errno(r, "Could not create runtime directory 'links': %m");
+        /* Always create the directories people can create inotify watches in. It is necessary to create the
+         * following subdirectories after drop_privileges() to make them owned by systemd-network. */
+        FOREACH_STRING(p,
+                       "/run/systemd/netif/dhcp-server-lease/",
+                       "/run/systemd/netif/leases/",
+                       "/run/systemd/netif/links/") {
+                r = mkdir_safe_label(p, 0755, UID_INVALID, GID_INVALID, MKDIR_WARN_MODE);
+                if (r < 0)
+                        log_warning_errno(r, "Could not create directory '%s': %m", p);
+        }
 
-        r = mkdir_safe_label("/run/systemd/netif/leases", 0755, UID_INVALID, GID_INVALID, MKDIR_WARN_MODE);
-        if (r < 0)
-                log_warning_errno(r, "Could not create runtime directory 'leases': %m");
-
-        r = mkdir_safe_label("/run/systemd/netif/lldp", 0755, UID_INVALID, GID_INVALID, MKDIR_WARN_MODE);
-        if (r < 0)
-                log_warning_errno(r, "Could not create runtime directory 'lldp': %m");
-
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
-
-        r = manager_new(&m);
+        r = manager_new(&m, /* test_mode= */ false);
         if (r < 0)
                 return log_error_errno(r, "Could not create manager: %m");
 
-        r = manager_connect_bus(m);
+        r = manager_setup(m);
         if (r < 0)
-                return log_error_errno(r, "Could not connect to bus: %m");
+                return log_error_errno(r, "Could not set up manager: %m");
 
         r = manager_parse_config_file(m);
         if (r < 0)
@@ -93,17 +99,15 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return r;
 
-        r = fw_ctx_new(&m->fw_ctx);
+        r = manager_deserialize(m);
         if (r < 0)
-                log_warning_errno(r, "Could not initialize firewall, IPMasquerade= option not available: %m");
+                log_warning_errno(r, "Failed to deserialize the previous invocation, ignoring: %m");
 
         r = manager_start(m);
         if (r < 0)
                 return log_error_errno(r, "Could not start manager: %m");
 
-        log_info("Enumeration completed");
-
-        notify_message = notify_start(NOTIFY_READY, NOTIFY_STOPPING);
+        notify_message = notify_start(NOTIFY_READY_MESSAGE, NOTIFY_STOPPING_MESSAGE);
 
         r = sd_event_loop(m->event);
         if (r < 0)

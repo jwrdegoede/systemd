@@ -2,17 +2,16 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/xattr.h>
 
 #include "chown-recursive.h"
 #include "dirent-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
-#include "macro.h"
-#include "stdio-util.h"
+#include "path-util.h"
 #include "strv.h"
 #include "user-util.h"
+#include "xattr-util.h"
 
 static int chown_one(
                 int fd,
@@ -21,22 +20,17 @@ static int chown_one(
                 gid_t gid,
                 mode_t mask) {
 
-        char procfs_path[STRLEN("/proc/self/fd/") + DECIMAL_STR_MAX(int) + 1];
-        const char *n;
         int r;
 
         assert(fd >= 0);
         assert(st);
 
-        /* We change ACLs through the /proc/self/fd/%i path, so that we have a stable reference that works
-         * with O_PATH. */
-        xsprintf(procfs_path, "/proc/self/fd/%i", fd);
-
         /* Drop any ACL if there is one */
-        FOREACH_STRING(n, "system.posix_acl_access", "system.posix_acl_default")
-                if (removexattr(procfs_path, n) < 0)
-                        if (!IN_SET(errno, ENODATA, EOPNOTSUPP, ENOSYS, ENOTTY))
-                                return -errno;
+        FOREACH_STRING(n, "system.posix_acl_access", "system.posix_acl_default") {
+                r = xremovexattr(fd, /* path= */ NULL, AT_EMPTY_PATH, n);
+                if (r < 0 && !ERRNO_IS_NEG_XATTR_ABSENT(r))
+                        return r;
+        }
 
         r = fchmod_and_chown(fd, st->st_mode & mask, uid, gid);
         if (r < 0)
@@ -54,7 +48,6 @@ static int chown_recursive_internal(
 
         _cleanup_closedir_ DIR *d = NULL;
         bool changed = false;
-        struct dirent *de;
         int r;
 
         assert(fd >= 0);
@@ -67,7 +60,7 @@ static int chown_recursive_internal(
         }
 
         FOREACH_DIRENT_ALL(de, d, return -errno) {
-                _cleanup_close_ int path_fd = -1;
+                _cleanup_close_ int path_fd = -EBADF;
                 struct stat fst;
 
                 if (dot_or_dot_dot(de->d_name))
@@ -115,12 +108,15 @@ int path_chown_recursive(
                 const char *path,
                 uid_t uid,
                 gid_t gid,
-                mode_t mask) {
+                mode_t mask,
+                int flags) {
 
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         struct stat st;
 
-        fd = open(path, O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW|O_NOATIME);
+        assert((flags & ~AT_SYMLINK_FOLLOW) == 0);
+
+        fd = open(path, O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOATIME|(FLAGS_SET(flags, AT_SYMLINK_FOLLOW) ? 0 : O_NOFOLLOW));
         if (fd < 0)
                 return -errno;
 
@@ -146,7 +142,7 @@ int fd_chown_recursive(
                 gid_t gid,
                 mode_t mask) {
 
-        int duplicated_fd = -1;
+        int duplicated_fd = -EBADF;
         struct stat st;
 
         /* Note that the slightly different order of fstat() and the checks here and in

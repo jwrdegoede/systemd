@@ -14,10 +14,11 @@ Documentation=man:localtime(5)
 Documentation=man:org.freedesktop.timedate1(5)
 
 [Service]
+Type=notify
 BusName=org.freedesktop.timedate1
 CapabilityBoundingSet=CAP_SYS_TIME
 DeviceAllow=char-rtc r
-ExecStart=@rootlibexecdir@/systemd-timedated
+ExecStart={{LIBEXECDIR}}/systemd-timedated
 IPAddressDeny=any
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
@@ -39,4 +40,4 @@ RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 SystemCallErrorNumber=EPERM
 SystemCallFilter=@system-service @clock
-@SERVICE_WATCHDOG@
+{{SERVICE_WATCHDOG}}

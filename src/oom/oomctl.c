@@ -1,13 +1,18 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
-#include <unistd.h>
 
+#include "sd-bus.h"
+
+#include "alloc-util.h"
+#include "build.h"
 #include "bus-error.h"
-#include "copy.h"
+#include "bus-locator.h"
+#include "bus-message-util.h"
+#include "log.h"
 #include "main-func.h"
+#include "pager.h"
 #include "pretty-print.h"
-#include "terminal-util.h"
 #include "verbs.h"
 
 static PagerFlags arg_pager_flags = 0;
@@ -16,7 +21,7 @@ static int help(int argc, char *argv[], void *userdata) {
         _cleanup_free_ char *link = NULL;
         int r;
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         r = terminal_urlify_man("oomctl", "1", &link);
         if (r < 0)
@@ -30,12 +35,13 @@ static int help(int argc, char *argv[], void *userdata) {
                "  -h --help                   Show this help\n"
                "     --version                Show package version\n"
                "     --no-pager               Do not pipe output into a pager\n"
-               "\nSee the %6$s for details.\n"
-               , program_invocation_short_name
-               , ansi_highlight(), ansi_normal()
-               , ansi_underline(), ansi_normal()
-               , link
-        );
+               "\nSee the %6$s for details.\n",
+               program_invocation_short_name,
+               ansi_highlight(),
+               ansi_normal(),
+               ansi_underline(),
+               ansi_normal(),
+               link);
 
         return 0;
 }
@@ -44,33 +50,19 @@ static int dump_state(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        int fd = -1;
         int r;
 
         r = sd_bus_open_system(&bus);
         if (r < 0)
                 return log_error_errno(r, "Failed to connect system bus: %m");
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.oom1",
-                        "/org/freedesktop/oom1",
-                        "org.freedesktop.oom1.Manager",
-                        "DumpByFileDescriptor",
-                        &error,
-                        &reply,
-                        NULL);
+        r = bus_call_method(bus, bus_oom_mgr, "DumpByFileDescriptor", &error, &reply, NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to dump context: %s", bus_error_message(&error, r));
 
-        r = sd_bus_message_read(reply, "h", &fd);
-        if (r < 0)
-                return bus_log_parse_error(r);
-
-        fflush(stdout);
-        return copy_bytes(fd, STDOUT_FILENO, (uint64_t) -1, 0);
+        return bus_message_dump_fd(reply);
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -109,7 +101,7 @@ static int parse_argv(int argc, char *argv[]) {
                                 return -EINVAL;
 
                         default:
-                                assert_not_reached("Invalid option passed.");
+                                assert_not_reached();
                 }
 
         return 1;
@@ -124,9 +116,7 @@ static int run(int argc, char* argv[]) {
 
         int r;
 
-        log_show_color(true);
-        log_parse_environment();
-        log_open();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)

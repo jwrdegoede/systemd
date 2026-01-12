@@ -2,26 +2,32 @@
 
 #include <getopt.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 
-#include "sd-daemon.h"
+#include "sd-event.h"
 
+#include "alloc-util.h"
+#include "build.h"
 #include "daemon-util.h"
+#include "hashmap.h"
+#include "log.h"
 #include "main-func.h"
-#include "manager.h"
+#include "parse-argument.h"
 #include "pretty-print.h"
-#include "signal-util.h"
 #include "socket-util.h"
 #include "strv.h"
+#include "time-util.h"
+#include "wait-online-manager.h"
 
 static bool arg_quiet = false;
 static usec_t arg_timeout = 120 * USEC_PER_SEC;
 static Hashmap *arg_interfaces = NULL;
 static char **arg_ignore = NULL;
-static LinkOperationalStateRange arg_required_operstate = { _LINK_OPERSTATE_INVALID, _LINK_OPERSTATE_INVALID };
+static LinkOperationalStateRange arg_required_operstate = LINK_OPERSTATE_RANGE_INVALID;
+static AddressFamily arg_required_family = ADDRESS_FAMILY_NO;
 static bool arg_any = false;
+static bool arg_requires_dns = false;
 
-STATIC_DESTRUCTOR_REGISTER(arg_interfaces, hashmap_free_free_freep);
+STATIC_DESTRUCTOR_REGISTER(arg_interfaces, hashmap_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_ignore, strv_freep);
 
 static int help(void) {
@@ -42,19 +48,21 @@ static int help(void) {
                "     --ignore=INTERFACE     Don't take these interfaces into account\n"
                "  -o --operational-state=MIN_OPERSTATE[:MAX_OPERSTATE]\n"
                "                            Required operational state\n"
+               "  -4 --ipv4                 Requires at least one IPv4 address\n"
+               "  -6 --ipv6                 Requires at least one IPv6 address\n"
                "     --any                  Wait until at least one of the interfaces is online\n"
                "     --timeout=SECS         Maximum time to wait for network connectivity\n"
-               "\nSee the %s for details.\n"
-               , program_invocation_short_name
-               , link
-        );
+               "     --dns                  Requires at least one DNS server to be accessible\n"
+               "\nSee the %s for details.\n",
+               program_invocation_short_name,
+               link);
 
         return 0;
 }
 
 static int parse_interface_with_operstate_range(const char *str) {
         _cleanup_free_ char *ifname = NULL;
-        _cleanup_free_ LinkOperationalStateRange *range;
+        _cleanup_free_ LinkOperationalStateRange *range = NULL;
         const char *p;
         int r;
 
@@ -68,12 +76,11 @@ static int parse_interface_with_operstate_range(const char *str) {
         if (p) {
                 r = parse_operational_state_range(p + 1, range);
                 if (r < 0)
-                         log_error_errno(r, "Invalid operational state range '%s'", p + 1);
+                        return log_error_errno(r, "Invalid operational state range: %s", p + 1);
 
                 ifname = strndup(optarg, p - optarg);
         } else {
-                range->min = _LINK_OPERSTATE_INVALID;
-                range->max = _LINK_OPERSTATE_INVALID;
+                *range = LINK_OPERSTATE_RANGE_INVALID;
                 ifname = strdup(str);
         }
         if (!ifname)
@@ -81,20 +88,19 @@ static int parse_interface_with_operstate_range(const char *str) {
 
         if (!ifname_valid(ifname))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Invalid interface name '%s'", ifname);
+                                       "Invalid interface name: %s", ifname);
 
-        r = hashmap_ensure_allocated(&arg_interfaces, &string_hash_ops);
-        if (r < 0)
+        r = hashmap_ensure_put(&arg_interfaces, &string_hash_ops_free_free, ifname, range);
+        if (r == -ENOMEM)
                 return log_oom();
-
-        r = hashmap_put(arg_interfaces, ifname, TAKE_PTR(range));
         if (r < 0)
                 return log_error_errno(r, "Failed to store interface name: %m");
         if (r == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Interface name %s is already specified", ifname);
+                return log_error_errno(SYNTHETIC_ERRNO(EEXIST),
+                                       "Interface name %s is already specified.", ifname);
 
         TAKE_PTR(ifname);
+        TAKE_PTR(range);
         return 0;
 }
 
@@ -105,6 +111,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_IGNORE,
                 ARG_ANY,
                 ARG_TIMEOUT,
+                ARG_DNS,
         };
 
         static const struct option options[] = {
@@ -114,8 +121,11 @@ static int parse_argv(int argc, char *argv[]) {
                 { "interface",         required_argument, NULL, 'i'         },
                 { "ignore",            required_argument, NULL, ARG_IGNORE  },
                 { "operational-state", required_argument, NULL, 'o'         },
+                { "ipv4",              no_argument,       NULL, '4'         },
+                { "ipv6",              no_argument,       NULL, '6'         },
                 { "any",               no_argument,       NULL, ARG_ANY     },
                 { "timeout",           required_argument, NULL, ARG_TIMEOUT },
+                { "dns",               optional_argument, NULL, ARG_DNS     },
                 {}
         };
 
@@ -124,7 +134,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hi:qo:", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "hi:qo:46", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -151,17 +161,20 @@ static int parse_argv(int argc, char *argv[]) {
 
                         break;
 
-                case 'o': {
-                        LinkOperationalStateRange range;
-
-                        r = parse_operational_state_range(optarg, &range);
+                case 'o':
+                        r = parse_operational_state_range(optarg, &arg_required_operstate);
                         if (r < 0)
                                 return log_error_errno(r, "Invalid operational state range '%s'", optarg);
-
-                        arg_required_operstate = range;
-
                         break;
-                }
+
+                case '4':
+                        arg_required_family |= ADDRESS_FAMILY_IPV4;
+                        break;
+
+                case '6':
+                        arg_required_family |= ADDRESS_FAMILY_IPV6;
+                        break;
+
                 case ARG_ANY:
                         arg_any = true;
                         break;
@@ -172,11 +185,17 @@ static int parse_argv(int argc, char *argv[]) {
                                 return r;
                         break;
 
+                case ARG_DNS:
+                        r = parse_boolean_argument("--dns", optarg, &arg_requires_dns);
+                        if (r < 0)
+                                return r;
+                        break;
+
                 case '?':
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unhandled option");
+                        assert_not_reached();
                 }
 
         return 1;
@@ -184,10 +203,10 @@ static int parse_argv(int argc, char *argv[]) {
 
 static int run(int argc, char *argv[]) {
         _cleanup_(manager_freep) Manager *m = NULL;
-        _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
+        _unused_ _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         int r;
 
-        log_setup_service();
+        log_setup();
 
         umask(0022);
 
@@ -198,9 +217,14 @@ static int run(int argc, char *argv[]) {
         if (arg_quiet)
                 log_set_max_level(LOG_ERR);
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
-
-        r = manager_new(&m, arg_interfaces, arg_ignore, arg_required_operstate, arg_any, arg_timeout);
+        r = manager_new(&m,
+                        arg_interfaces,
+                        arg_ignore,
+                        arg_required_operstate,
+                        arg_required_family,
+                        arg_any,
+                        arg_timeout,
+                        arg_requires_dns);
         if (r < 0)
                 return log_error_errno(r, "Could not create manager: %m");
 
@@ -212,6 +236,8 @@ static int run(int argc, char *argv[]) {
                                       "STATUS=Failed to wait for network connectivity...");
 
         r = sd_event_loop(m->event);
+        if (r == -ETIMEDOUT)
+                return log_error_errno(r, "Timeout occurred while waiting for network connectivity.");
         if (r < 0)
                 return log_error_errno(r, "Event loop failed: %m");
 

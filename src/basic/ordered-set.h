@@ -1,33 +1,37 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdio.h>
-
+#include "basic-forward.h"
 #include "hashmap.h"
 
 typedef struct OrderedSet OrderedSet;
 
-static inline OrderedSet* _ordered_set_new(const struct hash_ops *ops  HASHMAP_DEBUG_PARAMS) {
-        return (OrderedSet*) _ordered_hashmap_new(ops  HASHMAP_DEBUG_PASS_ARGS);
+static inline OrderedSet* ordered_set_new(const struct hash_ops *ops) {
+        return (OrderedSet*) ordered_hashmap_new(ops);
 }
-#define ordered_set_new(ops) _ordered_set_new(ops  HASHMAP_DEBUG_SRC_ARGS)
 
-int _ordered_set_ensure_allocated(OrderedSet **s, const struct hash_ops *ops  HASHMAP_DEBUG_PARAMS);
-#define ordered_set_ensure_allocated(s, ops) _ordered_set_ensure_allocated(s, ops  HASHMAP_DEBUG_SRC_ARGS)
+int ordered_set_ensure_allocated(OrderedSet **s, const struct hash_ops *ops);
 
-int _ordered_set_ensure_put(OrderedSet **s, const struct hash_ops *ops, void *p  HASHMAP_DEBUG_PARAMS);
-#define ordered_set_ensure_put(s, hash_ops, key) _ordered_set_ensure_put(s, hash_ops, key  HASHMAP_DEBUG_SRC_ARGS)
+int ordered_set_ensure_put(OrderedSet **s, const struct hash_ops *ops, void *p);
+
+static inline void ordered_set_clear(OrderedSet *s) {
+        return ordered_hashmap_clear((OrderedHashmap*) s);
+}
 
 static inline OrderedSet* ordered_set_free(OrderedSet *s) {
         return (OrderedSet*) ordered_hashmap_free((OrderedHashmap*) s);
 }
 
-static inline OrderedSet* ordered_set_free_free(OrderedSet *s) {
-        return (OrderedSet*) ordered_hashmap_free_free((OrderedHashmap*) s);
+static inline int ordered_set_contains(OrderedSet *s, const void *p) {
+        return ordered_hashmap_contains((OrderedHashmap*) s, p);
 }
 
 static inline int ordered_set_put(OrderedSet *s, void *p) {
         return ordered_hashmap_put((OrderedHashmap*) s, p, p);
+}
+
+static inline void *ordered_set_get(OrderedSet *s, const void *p) {
+        return ordered_hashmap_get((OrderedHashmap*) s, p);
 }
 
 static inline unsigned ordered_set_size(OrderedSet *s) {
@@ -58,10 +62,19 @@ static inline char** ordered_set_get_strv(OrderedSet *s) {
         return _hashmap_get_strv(HASHMAP_BASE((OrderedHashmap*) s));
 }
 
+static inline int ordered_set_reserve(OrderedSet *s, unsigned entries_add) {
+        return ordered_hashmap_reserve((OrderedHashmap*) s, entries_add);
+}
+
 int ordered_set_consume(OrderedSet *s, void *p);
-int ordered_set_put_strdup(OrderedSet *s, const char *p);
-int ordered_set_put_strdupv(OrderedSet *s, char **l);
-int ordered_set_put_string_set(OrderedSet *s, OrderedSet *l);
+
+int ordered_set_put_strdup_full(OrderedSet **s, const struct hash_ops *hash_ops, const char *p);
+#define ordered_set_put_strdup(s, p) ordered_set_put_strdup_full(s, &string_hash_ops_free, p)
+int ordered_set_put_strdupv_full(OrderedSet **s, const struct hash_ops *hash_ops, char **l);
+#define ordered_set_put_strdupv(s, l) ordered_set_put_strdupv_full(s, &string_hash_ops_free, l)
+int ordered_set_put_string_set_full(OrderedSet **s, const struct hash_ops *hash_ops, OrderedSet *l);
+#define ordered_set_put_string_set(s, l) ordered_set_put_string_set_full(s, &string_hash_ops_free, l)
+
 void ordered_set_print(FILE *f, const char *field, OrderedSet *s);
 
 #define _ORDERED_SET_FOREACH(e, s, i) \
@@ -70,7 +83,5 @@ void ordered_set_print(FILE *f, const char *field, OrderedSet *s);
         _ORDERED_SET_FOREACH(e, s, UNIQ_T(i, UNIQ))
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(OrderedSet*, ordered_set_free);
-DEFINE_TRIVIAL_CLEANUP_FUNC(OrderedSet*, ordered_set_free_free);
 
 #define _cleanup_ordered_set_free_ _cleanup_(ordered_set_freep)
-#define _cleanup_ordered_set_free_free_ _cleanup_(ordered_set_free_freep)

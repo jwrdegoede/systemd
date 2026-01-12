@@ -14,12 +14,19 @@
   Lesser General Public License for more details.
 
   You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  along with systemd; If not, see <https://www.gnu.org/licenses/>.
 ***/
+
+#include <errno.h>
+#include <inttypes.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
 
 /* This is a private header; never even think of including this directly! */
 
-#if defined(__INCLUDE_LEVEL__) && __INCLUDE_LEVEL__ <= 1 && !defined(__COVERITY__)
+#if defined(__INCLUDE_LEVEL__) && __INCLUDE_LEVEL__ <= 1 && !defined(__COVERITY__) && !defined(__clang_analyzer__) && !defined(__INTELLISENSE__)
 #  error "Do not include _sd-common.h directly; it is a private header."
 #endif
 
@@ -85,7 +92,7 @@ typedef void (*_sd_destroy_t)(void *userdata);
 #endif
 
 #ifndef _SD_ARRAY_STATIC
-#  if __STDC_VERSION__ >= 199901L
+#  if __STDC_VERSION__ >= 199901L && !defined(__cplusplus)
 #    define _SD_ARRAY_STATIC static
 #  else
 #    define _SD_ARRAY_STATIC
@@ -98,5 +105,28 @@ typedef void (*_sd_destroy_t)(void *userdata);
                         func(*p);                               \
         }                                                       \
         struct _sd_useless_struct_to_allow_trailing_semicolon_
+
+#define _SD_DECLARE_TRIVIAL_REF_FUNC(name) \
+        name* name##_ref(name *p)
+
+#define _SD_DECLARE_TRIVIAL_UNREF_FUNC(name) \
+        name* name##_unref(name *p)
+
+#define _SD_DECLARE_TRIVIAL_REF_UNREF_FUNC(name)      \
+        _SD_DECLARE_TRIVIAL_REF_FUNC(name);           \
+        _SD_DECLARE_TRIVIAL_UNREF_FUNC(name)
+
+/* The following macro should be used in all public enums, to force 64-bit wideness on them, so that we can
+ * freely extend them later on, without breaking compatibility. */
+#define _SD_ENUM_FORCE_S64(id)               \
+        _SD_##id##_INT64_MIN = INT64_MIN,    \
+        _SD_##id##_INT64_MAX = INT64_MAX
+
+/* In GCC 14 (C23) we can force enums to have the right types, and not solely rely on language extensions anymore */
+#if ((__GNUC__ >= 14) || (__STDC_VERSION__ >= 202311L)) && !defined(__cplusplus) && !defined(__EDG__)
+#  define _SD_ENUM_TYPE_S64(id) id : int64_t
+#else
+#  define _SD_ENUM_TYPE_S64(id) id
+#endif
 
 #endif

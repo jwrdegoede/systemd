@@ -3,11 +3,11 @@
 
 #include <linux/pkt_sched.h>
 
-#include "alloc-util.h"
-#include "conf-parser.h"
-#include "netlink-util.h"
+#include "sd-netlink.h"
+
+#include "codel.h"
+#include "log.h"
 #include "parse-util.h"
-#include "qdisc.h"
 #include "string-util.h"
 
 static int controlled_delay_init(QDisc *qdisc) {
@@ -31,50 +31,50 @@ static int controlled_delay_fill_message(Link *link, QDisc *qdisc, sd_netlink_me
         assert(qdisc);
         assert(req);
 
-        cd = CODEL(qdisc);
+        assert_se(cd = CODEL(qdisc));
 
         r = sd_netlink_message_open_container_union(req, TCA_OPTIONS, "codel");
         if (r < 0)
-                return log_link_error_errno(link, r, "Could not open container TCA_OPTIONS: %m");
+                return r;
 
         if (cd->packet_limit > 0) {
                 r = sd_netlink_message_append_u32(req, TCA_CODEL_LIMIT, cd->packet_limit);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_CODEL_LIMIT attribute: %m");
+                        return r;
         }
 
         if (cd->interval_usec > 0) {
                 r = sd_netlink_message_append_u32(req, TCA_CODEL_INTERVAL, cd->interval_usec);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_CODEL_INTERVAL attribute: %m");
+                        return r;
         }
 
         if (cd->target_usec > 0) {
                 r = sd_netlink_message_append_u32(req, TCA_CODEL_TARGET, cd->target_usec);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_CODEL_TARGET attribute: %m");
+                        return r;
         }
 
         if (cd->ecn >= 0) {
                 r = sd_netlink_message_append_u32(req, TCA_CODEL_ECN, cd->ecn);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_CODEL_ECN attribute: %m");
+                        return r;
         }
 
         if (cd->ce_threshold_usec != USEC_INFINITY) {
                 r = sd_netlink_message_append_u32(req, TCA_CODEL_CE_THRESHOLD, cd->ce_threshold_usec);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_CODEL_CE_THRESHOLD attribute: %m");
+                        return r;
         }
 
         r = sd_netlink_message_close_container(req);
         if (r < 0)
-                return log_link_error_errno(link, r, "Could not close container TCA_OPTIONS: %m");
+                return r;
 
         return 0;
 }
 
-int config_parse_controlled_delay_u32(
+int config_parse_codel_u32(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -86,15 +86,14 @@ int config_parse_controlled_delay_u32(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         ControlledDelay *cd;
-        Network *network = data;
+        Network *network = ASSERT_PTR(data);
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         r = qdisc_new_static(QDISC_KIND_CODEL, network, filename, section_line, &qdisc);
         if (r == -ENOMEM)
@@ -127,7 +126,7 @@ int config_parse_controlled_delay_u32(
         return 0;
 }
 
-int config_parse_controlled_delay_usec(
+int config_parse_codel_usec(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -139,16 +138,15 @@ int config_parse_controlled_delay_usec(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         ControlledDelay *cd;
-        Network *network = data;
+        Network *network = ASSERT_PTR(data);
         usec_t *p;
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         r = qdisc_new_static(QDISC_KIND_CODEL, network, filename, section_line, &qdisc);
         if (r == -ENOMEM)
@@ -168,7 +166,7 @@ int config_parse_controlled_delay_usec(
         else if (streq(lvalue, "CEThresholdSec"))
                 p = &cd->ce_threshold_usec;
         else
-                assert_not_reached("Invalid lvalue");
+                assert_not_reached();
 
         if (isempty(rvalue)) {
                 if (streq(lvalue, "CEThresholdSec"))
@@ -193,7 +191,7 @@ int config_parse_controlled_delay_usec(
         return 0;
 }
 
-int config_parse_controlled_delay_bool(
+int config_parse_codel_bool(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -205,15 +203,14 @@ int config_parse_controlled_delay_bool(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         ControlledDelay *cd;
-        Network *network = data;
+        Network *network = ASSERT_PTR(data);
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         r = qdisc_new_static(QDISC_KIND_CODEL, network, filename, section_line, &qdisc);
         if (r == -ENOMEM)
@@ -226,14 +223,7 @@ int config_parse_controlled_delay_bool(
 
         cd = CODEL(qdisc);
 
-        if (isempty(rvalue)) {
-                cd->ecn = -1;
-
-                qdisc = NULL;
-                return 0;
-        }
-
-        r = parse_boolean(rvalue);
+        r = parse_tristate(rvalue, &cd->ecn);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to parse '%s=', ignoring assignment: %s",
@@ -241,8 +231,7 @@ int config_parse_controlled_delay_bool(
                 return 0;
         }
 
-        cd->ecn = r;
-        qdisc = NULL;
+        TAKE_PTR(qdisc);
 
         return 0;
 }

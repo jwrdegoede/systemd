@@ -3,17 +3,16 @@
 
 #include "list.h"
 #include "socket-util.h"
-
-typedef struct ServerAddress ServerAddress;
-typedef struct ServerName ServerName;
+#include "timesyncd-forward.h"
 
 typedef enum ServerType {
         SERVER_SYSTEM,
         SERVER_FALLBACK,
         SERVER_LINK,
+        SERVER_RUNTIME,
+        _SERVER_TYPE_MAX,
+        _SERVER_TYPE_INVALID = -EINVAL,
 } ServerType;
-
-#include "timesyncd-manager.h"
 
 struct ServerAddress {
         ServerName *name;
@@ -27,10 +26,10 @@ struct ServerAddress {
 struct ServerName {
         Manager *manager;
 
+        bool marked;
+
         ServerType type;
         char *string;
-
-        bool marked:1;
 
         LIST_HEAD(ServerAddress, addresses);
         LIST_FIELDS(ServerName, names);

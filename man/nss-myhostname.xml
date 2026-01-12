@@ -1,6 +1,6 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="nss-myhostname" conditional='ENABLE_NSS_MYHOSTNAME'>
@@ -51,6 +51,14 @@
       ordered by their metric. This assigns a stable hostname to the
       current gateway, useful for referencing it independently of the
       current network configuration state.</para></listitem>
+
+      <listitem><para>The hostname <literal>_outbound</literal> is resolved to the local IPv4 and IPv6
+      addresses that are most likely used for communication with other hosts. This is the preferred source
+      addresses of default gateways if specified, or determined by requesting a routing decision to the
+      configured default gateways from the kernel and then using the local IP addresses selected by this
+      decision. This hostname is only available if there is at least one local default gateway configured.
+      This assigns a stable hostname to the local outbound IP addresses, useful for referencing them
+      independently of the current network configuration state.</para></listitem>
     </itemizedlist>
 
     <para>Various software relies on an always-resolvable local
@@ -66,13 +74,17 @@
     <para>To activate the NSS modules, add <literal>myhostname</literal> to the line starting with
     <literal>hosts:</literal> in <filename>/etc/nsswitch.conf</filename>.</para>
 
-    <para>It is recommended to place <literal>myhostname</literal> either between <literal>resolve</literal>
-    and "traditional" modules like <literal>dns</literal>, or after them. In the first version, well-known
-    names like <literal>localhost</literal> and the machine hostname are given higher priority than the
-    external configuration. This is recommended when the external DNS servers and network are not absolutely
-    trusted. In the second version, external configuration is given higher priority and
-    <command>nss-myhostname</command> only provides a fallback mechanism. This might be suitable in closely
-    controlled networks, for example on a company LAN.</para>
+    <para>It is recommended to place <literal>myhostname</literal> after <literal>files</literal> and before <literal>dns</literal>.
+    This resolves well-known hostnames like <literal>localhost</literal>
+    and the machine hostnames locally. It is consistent with the behaviour
+    of <command>nss-resolve</command>, and still allows overriding via
+    <filename>/etc/hosts</filename>.</para>
+
+    <para>Please keep in mind that <command>nss-myhostname</command> (and <command>nss-resolve</command>) also resolve
+    in the other direction — from locally attached IP addresses to
+    hostnames. If you rely on that lookup being provided by DNS, you might
+    want to order things differently.
+    </para>
   </refsect1>
 
   <refsect1>
@@ -82,14 +94,12 @@
     <command>nss-myhostname</command> correctly:</para>
 
     <!-- synchronize with other nss-* man pages and factory/etc/nsswitch.conf -->
-<programlisting>passwd:         compat systemd
-group:          compat [SUCCESS=merge] systemd
-shadow:         compat
+<programlisting>passwd:         files systemd
+group:          files [SUCCESS=merge] systemd
+shadow:         files systemd
+gshadow:        files systemd
 
-# Either (untrusted network, see above):
 hosts:          mymachines resolve [!UNAVAIL=return] files <command>myhostname</command> dns
-# Or (only trusted networks):
-hosts:          mymachines resolve [!UNAVAIL=return] files dns <command>myhostname</command>
 networks:       files
 
 protocols:      db files
@@ -99,7 +109,9 @@ rpc:            db files
 
 netgroup:       nis</programlisting>
 
-    <para>To test, use <command>glibc</command>'s <command>getent</command> tool:</para>
+    <para>To test, use <command>glibc</command>'s
+    <citerefentry project='man-pages'><refentrytitle>getent</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+    tool:</para>
 
     <programlisting>$ getent ahosts `hostname`
 ::1       STREAM omega
@@ -115,14 +127,14 @@ netgroup:       nis</programlisting>
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>nss-systemd</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>nss-resolve</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>nss-mymachines</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>nsswitch.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>getent</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>nss-systemd</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>nss-resolve</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>nss-mymachines</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>nsswitch.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>getent</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

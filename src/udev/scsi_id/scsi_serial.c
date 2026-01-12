@@ -5,26 +5,22 @@
  * Author: Patrick Mansfield<patmans@us.ibm.com>
  */
 
-#include <errno.h>
 #include <fcntl.h>
-#include <inttypes.h>
 #include <linux/bsg.h>
-#include <linux/types.h>
 #include <scsi/scsi.h>
 #include <scsi/sg.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <time.h>
 #include <unistd.h>
 
-#include "memory-util.h"
+#include "devnum-util.h"
+#include "log.h"
 #include "random-util.h"
 #include "scsi.h"
 #include "scsi_id.h"
 #include "string-util.h"
+#include "time-util.h"
 
 /*
  * A priority based list of id, naa, and binary/ascii for the identifier
@@ -69,6 +65,7 @@ static const char hex_str[]="0123456789abcdef";
 #define DID_NO_CONNECT               0x01        /* Unable to connect before timeout */
 #define DID_BUS_BUSY                 0x02        /* Bus remain busy until timeout */
 #define DID_TIME_OUT                 0x03        /* Timed out for some other reason */
+#define DID_TRANSPORT_DISRUPTED      0x0e        /* Transport disrupted and should retry */
 #define DRIVER_TIMEOUT               0x06
 #define DRIVER_SENSE                 0x08        /* Sense_buffer has been set */
 
@@ -79,6 +76,7 @@ static const char hex_str[]="0123456789abcdef";
 #define SG_ERR_CAT_TIMEOUT              3
 #define SG_ERR_CAT_RECOVERED            4        /* Successful command after recovered err */
 #define SG_ERR_CAT_NOTSUPPORTED         5        /* Illegal / unsupported command */
+#define SG_ERR_CAT_RETRY                6        /* Command should be retried */
 #define SG_ERR_CAT_SENSE               98        /* Something else in the sense buffer */
 #define SG_ERR_CAT_OTHER               99        /* Some other error/warning */
 
@@ -126,6 +124,8 @@ static int sg_err_category_new(int scsi_status, int msg_status, int
         if (host_status) {
                 if (IN_SET(host_status, DID_NO_CONNECT, DID_BUS_BUSY, DID_TIME_OUT))
                         return SG_ERR_CAT_TIMEOUT;
+                if (host_status == DID_TRANSPORT_DISRUPTED)
+                        return SG_ERR_CAT_RETRY;
         }
         if (driver_status) {
                 if (driver_status == DRIVER_TIMEOUT)
@@ -150,16 +150,13 @@ static int sg_err_category4(struct sg_io_v4 *hp) {
 static int scsi_dump_sense(struct scsi_id_device *dev_scsi,
                            unsigned char *sense_buffer, int sb_len) {
         int s;
-        int code;
-        int sense_class;
-        int sense_key;
-        int asc, ascq;
+        unsigned code, sense_class, sense_key, asc, ascq;
 
         /*
          * Figure out and print the sense key, asc and ascq.
          *
          * If you want to suppress these for a particular drive model, add
-         * a black list entry in the scsi_id config file.
+         * a deny list entry in the scsi_id config file.
          *
          * XXX We probably need to: lookup the sense/asc/ascq in a retry
          * table, and if found return 1 (after dumping the sense, asc, and
@@ -217,11 +214,11 @@ static int scsi_dump_sense(struct scsi_id_device *dev_scsi,
                                                4 - sb_len);
 
                 if (sense_buffer[0] < 15)
-                        log_debug("%s: old sense key: 0x%x", dev_scsi->kernel, sense_buffer[0] & 0x0f);
+                        log_debug("%s: old sense key: 0x%x", dev_scsi->kernel, sense_buffer[0] & 0x0fu);
                 else
                         log_debug("%s: sense = %2x %2x",
                                   dev_scsi->kernel, sense_buffer[0], sense_buffer[2]);
-                log_debug("%s: non-extended sense class %d code 0x%0x",
+                log_debug("%s: non-extended sense class %u code 0x%0x",
                           dev_scsi->kernel, sense_class, code);
 
         }
@@ -237,7 +234,7 @@ static int scsi_dump(struct scsi_id_device *dev_scsi, struct sg_io_hdr *io) {
                  */
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "%s: called with no error",
-                                       __FUNCTION__);
+                                       __func__);
 
         log_debug("%s: sg_io failed status 0x%x 0x%x 0x%x 0x%x",
                   dev_scsi->kernel, io->driver_status, io->host_status, io->msg_status, io->status);
@@ -255,7 +252,7 @@ static int scsi_dump_v4(struct scsi_id_device *dev_scsi, struct sg_io_v4 *io) {
                  */
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "%s: called with no error",
-                                       __FUNCTION__);
+                                       __func__);
 
         log_debug("%s: sg_io failed status 0x%x 0x%x 0x%x",
                   dev_scsi->kernel, io->driver_status, io->transport_status, io->device_status);
@@ -280,7 +277,7 @@ static int scsi_inquiry(struct scsi_id_device *dev_scsi, int fd,
 
         if (buflen > SCSI_INQ_BUFF_LEN)
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "buflen %d too long", buflen);
+                                       "buflen %u too long", buflen);
 
 resend:
         if (dev_scsi->use_sg == 4) {
@@ -331,6 +328,8 @@ resend:
                 case SG_ERR_CAT_CLEAN:
                 case SG_ERR_CAT_RECOVERED:
                         retval = 0;
+                        break;
+                case SG_ERR_CAT_RETRY:
                         break;
 
                 default:
@@ -553,7 +552,6 @@ static int do_scsi_page83_inquiry(struct scsi_id_device *dev_scsi, int fd,
                                   char *unit_serial_number, char *wwn,
                                   char *wwn_vendor_extension, char *tgpt_group) {
         int retval;
-        unsigned id_ind, j;
         unsigned char page_83[SCSI_INQ_BUFF_LEN];
 
         /* also pick up the page 80 serial number */
@@ -607,16 +605,14 @@ static int do_scsi_page83_inquiry(struct scsi_id_device *dev_scsi, int fd,
          * Search for a match in the prioritized id_search_list - since WWN ids
          * come first we can pick up the WWN in check_fill_0x83_id().
          */
-        for (id_ind = 0;
-             id_ind < sizeof(id_search_list)/sizeof(id_search_list[0]);
-             id_ind++) {
+        FOREACH_ELEMENT(search_value, id_search_list) {
                 /*
                  * Examine each descriptor returned. There is normally only
                  * one or a small number of descriptors.
                  */
-                for (j = 4; j <= ((unsigned)page_83[2] << 8) + (unsigned)page_83[3] + 3; j += page_83[j + 3] + 4) {
+                for (unsigned j = 4; j <= ((unsigned)page_83[2] << 8) + (unsigned)page_83[3] + 3; j += page_83[j + 3] + 4) {
                         retval = check_fill_0x83_id(dev_scsi, page_83 + j,
-                                                    id_search_list + id_ind,
+                                                    search_value,
                                                     serial, serial_short, len,
                                                     wwn, wwn_vendor_extension,
                                                     tgpt_group);
@@ -747,7 +743,7 @@ int scsi_std_inquiry(struct scsi_id_device *dev_scsi, const char *devname) {
         struct stat statbuf;
         int err = 0;
 
-        fd = open(devname, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        fd = open(devname, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY);
         if (fd < 0) {
                 log_debug_errno(errno, "scsi_id: cannot open %s: %m", devname);
                 return 1;
@@ -758,8 +754,7 @@ int scsi_std_inquiry(struct scsi_id_device *dev_scsi, const char *devname) {
                 err = 2;
                 goto out;
         }
-        sprintf(dev_scsi->kernel,"%d:%d", major(statbuf.st_rdev),
-                minor(statbuf.st_rdev));
+        format_devnum(statbuf.st_rdev, dev_scsi->kernel);
 
         memzero(buf, SCSI_INQ_BUFF_LEN);
         err = scsi_inquiry(dev_scsi, fd, 0, 0, buf, SCSI_INQ_BUFF_LEN);
@@ -773,7 +768,7 @@ int scsi_std_inquiry(struct scsi_id_device *dev_scsi, const char *devname) {
         dev_scsi->model[16] = '\0';
         memcpy(dev_scsi->revision, buf + 32, 4);
         dev_scsi->revision[4] = '\0';
-        sprintf(dev_scsi->type,"%x", buf[0] & 0x1f);
+        dev_scsi->type = buf[0] & 0x1f;
 
 out:
         close(fd);
@@ -783,22 +778,18 @@ out:
 int scsi_get_serial(struct scsi_id_device *dev_scsi, const char *devname,
                     int page_code, int len) {
         unsigned char page0[SCSI_INQ_BUFF_LEN];
-        int fd = -1;
+        int fd = -EBADF;
         int cnt;
         int ind;
         int retval;
 
         memzero(dev_scsi->serial, len);
-        initialize_srand();
         for (cnt = 20; cnt > 0; cnt--) {
-                struct timespec duration;
-
-                fd = open(devname, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+                fd = open(devname, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY);
                 if (fd >= 0 || errno != EBUSY)
                         break;
-                duration.tv_sec = 0;
-                duration.tv_nsec = (200 * 1000 * 1000) + (rand() % 100 * 1000 * 1000);
-                nanosleep(&duration, NULL);
+
+                usleep_safe(200U*USEC_PER_MSEC + random_u64_range(100U*USEC_PER_MSEC));
         }
         if (fd < 0)
                 return 1;

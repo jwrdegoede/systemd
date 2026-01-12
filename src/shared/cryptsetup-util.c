@@ -1,83 +1,65 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#if HAVE_LIBCRYPTSETUP
+#include <stdlib.h>
+
+#include "sd-json.h"
+
 #include "alloc-util.h"
 #include "cryptsetup-util.h"
 #include "dlfcn-util.h"
 #include "log.h"
 #include "parse-util.h"
+#include "string-util.h"
+#include "strv.h"
 
+#if HAVE_LIBCRYPTSETUP
 static void *cryptsetup_dl = NULL;
 
-int (*sym_crypt_activate_by_passphrase)(struct crypt_device *cd, const char *name, int keyslot, const char *passphrase, size_t passphrase_size, uint32_t flags);
-#if HAVE_CRYPT_ACTIVATE_BY_SIGNED_KEY
-int (*sym_crypt_activate_by_signed_key)(struct crypt_device *cd, const char *name, const char *volume_key, size_t volume_key_size, const char *signature, size_t signature_size, uint32_t flags);
+DLSYM_PROTOTYPE(crypt_activate_by_passphrase) = NULL;
+DLSYM_PROTOTYPE(crypt_activate_by_signed_key) = NULL;
+DLSYM_PROTOTYPE(crypt_activate_by_volume_key) = NULL;
+DLSYM_PROTOTYPE(crypt_deactivate_by_name) = NULL;
+DLSYM_PROTOTYPE(crypt_format) = NULL;
+DLSYM_PROTOTYPE(crypt_free) = NULL;
+DLSYM_PROTOTYPE(crypt_get_cipher) = NULL;
+DLSYM_PROTOTYPE(crypt_get_cipher_mode) = NULL;
+DLSYM_PROTOTYPE(crypt_get_data_offset) = NULL;
+DLSYM_PROTOTYPE(crypt_get_device_name) = NULL;
+DLSYM_PROTOTYPE(crypt_get_dir) = NULL;
+DLSYM_PROTOTYPE(crypt_get_type) = NULL;
+DLSYM_PROTOTYPE(crypt_get_uuid) = NULL;
+DLSYM_PROTOTYPE(crypt_get_verity_info) = NULL;
+DLSYM_PROTOTYPE(crypt_get_volume_key_size) = NULL;
+DLSYM_PROTOTYPE(crypt_header_restore) = NULL;
+DLSYM_PROTOTYPE(crypt_init) = NULL;
+DLSYM_PROTOTYPE(crypt_init_by_name) = NULL;
+DLSYM_PROTOTYPE(crypt_keyslot_add_by_volume_key) = NULL;
+DLSYM_PROTOTYPE(crypt_keyslot_destroy) = NULL;
+DLSYM_PROTOTYPE(crypt_keyslot_max) = NULL;
+DLSYM_PROTOTYPE(crypt_load) = NULL;
+DLSYM_PROTOTYPE(crypt_metadata_locking) = NULL;
+DLSYM_PROTOTYPE(crypt_reencrypt_init_by_passphrase) = NULL;
+DLSYM_PROTOTYPE(crypt_reencrypt_run);
+DLSYM_PROTOTYPE(crypt_resize) = NULL;
+DLSYM_PROTOTYPE(crypt_resume_by_volume_key) = NULL;
+DLSYM_PROTOTYPE(crypt_set_data_device) = NULL;
+DLSYM_PROTOTYPE(crypt_set_data_offset) = NULL;
+DLSYM_PROTOTYPE(crypt_set_debug_level) = NULL;
+DLSYM_PROTOTYPE(crypt_set_log_callback) = NULL;
+DLSYM_PROTOTYPE(crypt_set_metadata_size) = NULL;
+DLSYM_PROTOTYPE(crypt_set_pbkdf_type) = NULL;
+DLSYM_PROTOTYPE(crypt_suspend) = NULL;
+DLSYM_PROTOTYPE(crypt_token_json_get) = NULL;
+DLSYM_PROTOTYPE(crypt_token_json_set) = NULL;
+DLSYM_PROTOTYPE(crypt_token_max) = NULL;
+#if HAVE_CRYPT_TOKEN_SET_EXTERNAL_PATH
+DLSYM_PROTOTYPE(crypt_token_set_external_path) = NULL;
 #endif
-int (*sym_crypt_activate_by_volume_key)(struct crypt_device *cd, const char *name, const char *volume_key, size_t volume_key_size, uint32_t flags);
-int (*sym_crypt_deactivate_by_name)(struct crypt_device *cd, const char *name, uint32_t flags);
-int (*sym_crypt_format)(struct crypt_device *cd, const char *type, const char *cipher, const char *cipher_mode, const char *uuid, const char *volume_key, size_t volume_key_size, void *params);
-void (*sym_crypt_free)(struct crypt_device *cd);
-const char *(*sym_crypt_get_dir)(void);
-int (*sym_crypt_get_verity_info)(struct crypt_device *cd, struct crypt_params_verity *vp);
-int (*sym_crypt_init)(struct crypt_device **cd, const char *device);
-int (*sym_crypt_init_by_name)(struct crypt_device **cd, const char *name);
-int (*sym_crypt_keyslot_add_by_volume_key)(struct crypt_device *cd, int keyslot, const char *volume_key, size_t volume_key_size, const char *passphrase, size_t passphrase_size);
-int (*sym_crypt_load)(struct crypt_device *cd, const char *requested_type, void *params);
-int (*sym_crypt_resize)(struct crypt_device *cd, const char *name, uint64_t new_size);
-int (*sym_crypt_set_data_device)(struct crypt_device *cd, const char *device);
-void (*sym_crypt_set_debug_level)(int level);
-void (*sym_crypt_set_log_callback)(struct crypt_device *cd, void (*log)(int level, const char *msg, void *usrptr), void *usrptr);
-int (*sym_crypt_set_pbkdf_type)(struct crypt_device *cd, const struct crypt_pbkdf_type *pbkdf) = NULL;
-int (*sym_crypt_token_json_get)(struct crypt_device *cd, int token, const char **json) = NULL;
-int (*sym_crypt_token_json_set)(struct crypt_device *cd, int token, const char *json) = NULL;
-int (*sym_crypt_volume_key_get)(struct crypt_device *cd, int keyslot, char *volume_key, size_t *volume_key_size, const char *passphrase, size_t passphrase_size);
-
-int dlopen_cryptsetup(void) {
-        _cleanup_(dlclosep) void *dl = NULL;
-        int r;
-
-        if (cryptsetup_dl)
-                return 0; /* Already loaded */
-
-        dl = dlopen("libcryptsetup.so.12", RTLD_LAZY);
-        if (!dl)
-                return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                       "libcryptsetup support is not installed: %s", dlerror());
-
-        r = dlsym_many_and_warn(
-                        dl,
-                        LOG_DEBUG,
-                        DLSYM_ARG(crypt_activate_by_passphrase),
-#if HAVE_CRYPT_ACTIVATE_BY_SIGNED_KEY
-                        DLSYM_ARG(crypt_activate_by_signed_key),
-#endif
-                        DLSYM_ARG(crypt_activate_by_volume_key),
-                        DLSYM_ARG(crypt_deactivate_by_name),
-                        DLSYM_ARG(crypt_format),
-                        DLSYM_ARG(crypt_free),
-                        DLSYM_ARG(crypt_get_dir),
-                        DLSYM_ARG(crypt_get_verity_info),
-                        DLSYM_ARG(crypt_init),
-                        DLSYM_ARG(crypt_init_by_name),
-                        DLSYM_ARG(crypt_keyslot_add_by_volume_key),
-                        DLSYM_ARG(crypt_load),
-                        DLSYM_ARG(crypt_resize),
-                        DLSYM_ARG(crypt_set_data_device),
-                        DLSYM_ARG(crypt_set_debug_level),
-                        DLSYM_ARG(crypt_set_log_callback),
-                        DLSYM_ARG(crypt_set_pbkdf_type),
-                        DLSYM_ARG(crypt_token_json_get),
-                        DLSYM_ARG(crypt_token_json_set),
-                        DLSYM_ARG(crypt_volume_key_get),
-                        NULL);
-        if (r < 0)
-                return r;
-
-        /* Note that we never release the reference here, because there's no real reason to, after all this
-         * was traditionally a regular shared library dependency which lives forever too. */
-        cryptsetup_dl = TAKE_PTR(dl);
-        return 1;
-}
+DLSYM_PROTOTYPE(crypt_token_status) = NULL;
+DLSYM_PROTOTYPE(crypt_volume_key_get) = NULL;
+DLSYM_PROTOTYPE(crypt_volume_key_keyring) = NULL;
+DLSYM_PROTOTYPE(crypt_wipe) = NULL;
+DLSYM_PROTOTYPE(crypt_get_integrity_info) = NULL;
 
 static void cryptsetup_log_glue(int level, const char *msg, void *usrptr) {
 
@@ -103,13 +85,17 @@ static void cryptsetup_log_glue(int level, const char *msg, void *usrptr) {
 }
 
 void cryptsetup_enable_logging(struct crypt_device *cd) {
-        if (!cd)
-                return;
+        /* It's OK to call this with a NULL parameter, in which case libcryptsetup will set the default log
+         * function.
+         *
+         * Note that this is also called from dlopen_cryptsetup(), which we call here too. Sounds like an
+         * endless loop, but isn't because we break it via the check for 'cryptsetup_dl' early in
+         * dlopen_cryptsetup(). */
 
-        if (dlopen_cryptsetup() < 0) /* If this fails, let's gracefully ignore the issue, this is just debug
-                                      * logging after all, and if this failed we already generated a debug
-                                      * log message that should help to track things down. */
-                return;
+        if (dlopen_cryptsetup() < 0)
+                return; /* If this fails, let's gracefully ignore the issue, this is just debug logging after
+                         * all, and if this failed we already generated a debug log message that should help
+                         * to track things down. */
 
         sym_crypt_set_log_callback(cd, cryptsetup_log_glue, NULL);
         sym_crypt_set_debug_level(DEBUG_LOGGING ? CRYPT_DEBUG_ALL : CRYPT_DEBUG_NONE);
@@ -117,11 +103,15 @@ void cryptsetup_enable_logging(struct crypt_device *cd) {
 
 int cryptsetup_set_minimal_pbkdf(struct crypt_device *cd) {
 
+        /* With CRYPT_PBKDF_NO_BENCHMARK flag set .time_ms member is ignored
+         * while .iterations must be set at least to recommended minimum value. */
+
         static const struct crypt_pbkdf_type minimal_pbkdf = {
                 .hash = "sha512",
                 .type = CRYPT_KDF_PBKDF2,
-                .iterations = 1,
-                .time_ms = 1,
+                .iterations = 1000, /* recommended minimum count for pbkdf2
+                                     * according to NIST SP 800-132, ch. 5.2 */
+                .flags = CRYPT_PBKDF_NO_BENCHMARK
         };
 
         int r;
@@ -143,9 +133,9 @@ int cryptsetup_get_token_as_json(
                 struct crypt_device *cd,
                 int idx,
                 const char *verify_type,
-                JsonVariant **ret) {
+                sd_json_variant **ret) {
 
-        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         const char *text;
         int r;
 
@@ -167,18 +157,18 @@ int cryptsetup_get_token_as_json(
         if (r < 0)
                 return r;
 
-        r = json_parse(text, 0, &v, NULL, NULL);
+        r = sd_json_parse(text, 0, &v, NULL, NULL);
         if (r < 0)
                 return r;
 
         if (verify_type) {
-                JsonVariant *w;
+                sd_json_variant *w;
 
-                w = json_variant_by_key(v, "type");
+                w = sd_json_variant_by_key(v, "type");
                 if (!w)
                         return -EINVAL;
 
-                if (!streq_ptr(json_variant_string(w), verify_type))
+                if (!streq_ptr(sd_json_variant_string(w), verify_type))
                         return -EMEDIUMTYPE;
         }
 
@@ -188,36 +178,7 @@ int cryptsetup_get_token_as_json(
         return 0;
 }
 
-int cryptsetup_get_keyslot_from_token(JsonVariant *v) {
-        int keyslot, r;
-        JsonVariant *w;
-
-        /* Parses the "keyslots" field of a LUKS2 token object. The field can be an array, but here we assume
-         * that it contains a single element only, since that's the only way we ever generate it
-         * ourselves. */
-
-        w = json_variant_by_key(v, "keyslots");
-        if (!w)
-                return -ENOENT;
-        if (!json_variant_is_array(w) || json_variant_elements(w) != 1)
-                return -EMEDIUMTYPE;
-
-        w = json_variant_by_index(w, 0);
-        if (!w)
-                return -ENOENT;
-        if (!json_variant_is_string(w))
-                return -EMEDIUMTYPE;
-
-        r = safe_atoi(json_variant_string(w), &keyslot);
-        if (r < 0)
-                return r;
-        if (keyslot < 0)
-                return -EINVAL;
-
-        return keyslot;
-}
-
-int cryptsetup_add_token_json(struct crypt_device *cd, JsonVariant *v) {
+int cryptsetup_add_token_json(struct crypt_device *cd, sd_json_variant *v) {
         _cleanup_free_ char *text = NULL;
         int r;
 
@@ -225,7 +186,7 @@ int cryptsetup_add_token_json(struct crypt_device *cd, JsonVariant *v) {
         if (r < 0)
                 return r;
 
-        r = json_variant_format(v, 0, &text);
+        r = sd_json_variant_format(v, 0, &text);
         if (r < 0)
                 return log_debug_errno(r, "Failed to format token data for LUKS: %m");
 
@@ -238,3 +199,125 @@ int cryptsetup_add_token_json(struct crypt_device *cd, JsonVariant *v) {
         return 0;
 }
 #endif
+
+int dlopen_cryptsetup(void) {
+#if HAVE_LIBCRYPTSETUP
+        int r;
+
+        /* libcryptsetup added crypt_reencrypt() in 2.2.0, and marked it obsolete in 2.4.0, replacing it with
+         * crypt_reencrypt_run(), which takes one extra argument but is otherwise identical. The old call is
+         * still available though, and given we want to support 2.2.0 for a while longer, we'll use the old
+         * symbol if the new one is not available. */
+
+        ELF_NOTE_DLOPEN("cryptsetup",
+                        "Support for disk encryption, integrity, and authentication",
+                        ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
+                        "libcryptsetup.so.12");
+
+        r = dlopen_many_sym_or_warn(
+                        &cryptsetup_dl, "libcryptsetup.so.12", LOG_DEBUG,
+                        DLSYM_ARG(crypt_activate_by_passphrase),
+                        DLSYM_ARG(crypt_activate_by_signed_key),
+                        DLSYM_ARG(crypt_activate_by_volume_key),
+                        DLSYM_ARG(crypt_deactivate_by_name),
+                        DLSYM_ARG(crypt_format),
+                        DLSYM_ARG(crypt_free),
+                        DLSYM_ARG(crypt_get_cipher),
+                        DLSYM_ARG(crypt_get_cipher_mode),
+                        DLSYM_ARG(crypt_get_data_offset),
+                        DLSYM_ARG(crypt_get_device_name),
+                        DLSYM_ARG(crypt_get_dir),
+                        DLSYM_ARG(crypt_get_type),
+                        DLSYM_ARG(crypt_get_uuid),
+                        DLSYM_ARG(crypt_get_verity_info),
+                        DLSYM_ARG(crypt_get_volume_key_size),
+                        DLSYM_ARG(crypt_header_restore),
+                        DLSYM_ARG(crypt_init),
+                        DLSYM_ARG(crypt_init_by_name),
+                        DLSYM_ARG(crypt_keyslot_add_by_volume_key),
+                        DLSYM_ARG(crypt_keyslot_destroy),
+                        DLSYM_ARG(crypt_keyslot_max),
+                        DLSYM_ARG(crypt_load),
+                        DLSYM_ARG(crypt_metadata_locking),
+                        DLSYM_ARG(crypt_reencrypt_init_by_passphrase),
+                        DLSYM_ARG(crypt_reencrypt_run),
+                        DLSYM_ARG(crypt_resize),
+                        DLSYM_ARG(crypt_resume_by_volume_key),
+                        DLSYM_ARG(crypt_set_data_device),
+                        DLSYM_ARG(crypt_set_data_offset),
+                        DLSYM_ARG(crypt_set_debug_level),
+                        DLSYM_ARG(crypt_set_log_callback),
+                        DLSYM_ARG(crypt_set_metadata_size),
+                        DLSYM_ARG(crypt_set_pbkdf_type),
+                        DLSYM_ARG(crypt_suspend),
+                        DLSYM_ARG(crypt_token_json_get),
+                        DLSYM_ARG(crypt_token_json_set),
+                        DLSYM_ARG(crypt_token_max),
+#if HAVE_CRYPT_TOKEN_SET_EXTERNAL_PATH
+                        DLSYM_ARG(crypt_token_set_external_path),
+#endif
+                        DLSYM_ARG(crypt_token_status),
+                        DLSYM_ARG(crypt_volume_key_get),
+                        DLSYM_ARG(crypt_volume_key_keyring),
+                        DLSYM_ARG(crypt_wipe),
+                        DLSYM_ARG(crypt_get_integrity_info));
+        if (r <= 0)
+                return r;
+
+        /* Redirect the default logging calls of libcryptsetup to our own logging infra. (Note that
+         * libcryptsetup also maintains per-"struct crypt_device" log functions, which we'll also set
+         * whenever allocating a "struct crypt_device" context. Why set both? To be defensive: maybe some
+         * other code loaded into this process also changes the global log functions of libcryptsetup, who
+         * knows? And if so, we still want our own objects to log via our own infra, at the very least.) */
+        cryptsetup_enable_logging(NULL);
+
+        const char *e = secure_getenv("SYSTEMD_CRYPTSETUP_TOKEN_PATH");
+        if (e) {
+#if HAVE_CRYPT_TOKEN_SET_EXTERNAL_PATH
+                r = sym_crypt_token_set_external_path(e);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to set the libcryptsetup external token path to '%s', ignoring: %m", e);
+#else
+                log_debug("libcryptsetup version does not support setting the external token path, not setting it to '%s'.", e);
+#endif
+        }
+
+        return 1;
+#else
+        return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "cryptsetup support is not compiled in.");
+#endif
+}
+
+int cryptsetup_get_keyslot_from_token(sd_json_variant *v) {
+        int keyslot, r;
+        sd_json_variant *w;
+
+        /* Parses the "keyslots" field of a LUKS2 token object. The field can be an array, but here we assume
+         * that it contains a single element only, since that's the only way we ever generate it
+         * ourselves. */
+
+        w = sd_json_variant_by_key(v, "keyslots");
+        if (!w)
+                return -ENOENT;
+        if (!sd_json_variant_is_array(w) || sd_json_variant_elements(w) != 1)
+                return -EMEDIUMTYPE;
+
+        w = sd_json_variant_by_index(w, 0);
+        if (!w)
+                return -ENOENT;
+        if (!sd_json_variant_is_string(w))
+                return -EMEDIUMTYPE;
+
+        r = safe_atoi(sd_json_variant_string(w), &keyslot);
+        if (r < 0)
+                return r;
+        if (keyslot < 0)
+                return -EINVAL;
+
+        return keyslot;
+}
+
+const char* mangle_none(const char *s) {
+        /* A helper that turns cryptsetup/integritysetup/veritysetup "options" strings into NULL if they are effectively empty */
+        return isempty(s) || STR_IN_SET(s, "-", "none") ? NULL : s;
+}

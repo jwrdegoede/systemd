@@ -1,13 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-
 #include "alloc-util.h"
-#include "macro.h"
-#include "parse-util.h"
 #include "proc-cmdline.h"
 #include "string-table.h"
-#include "string-util.h"
 #include "volatile-util.h"
 
 int query_volatile_mode(VolatileMode *ret) {
@@ -27,7 +22,7 @@ int query_volatile_mode(VolatileMode *ret) {
 
                 m = volatile_mode_from_string(mode);
                 if (m < 0)
-                        return -EINVAL;
+                        return m;
 
                 *ret = m;
         } else

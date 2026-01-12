@@ -10,11 +10,18 @@
 [Unit]
 Description=Flush Journal to Persistent Storage
 Documentation=man:systemd-journald.service(8) man:journald.conf(5)
+
+ConditionPathExists=!/etc/initrd-release
+
 DefaultDependencies=no
-Requires=systemd-journald.service
-After=systemd-journald.service systemd-remount-fs.service
+After=systemd-remount-fs.service systemd-quotacheck-root.service
 Before=systemd-tmpfiles-setup.service
+Wants=systemd-journald.service
+After=systemd-journald.service
 RequiresMountsFor=/var/log/journal
+
+Before=soft-reboot.target systemd-soft-reboot.service
+Conflicts=soft-reboot.target
 
 [Service]
 ExecStart=journalctl --flush

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "conf-parser.h"
+#include "log.h"
 #include "parse-util.h"
 #include "string-util.h"
 #include "vlan-util.h"
@@ -49,11 +49,10 @@ int config_parse_default_port_vlanid(
                 const char *rvalue,
                 void *data,
                 void *userdata) {
-        uint16_t *id = data;
+        uint16_t *id = ASSERT_PTR(data);
 
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         if (streq(rvalue, "none")) {
                 *id = 0;
@@ -76,13 +75,12 @@ int config_parse_vlanid(
                 void *data,
                 void *userdata) {
 
-        uint16_t *id = data;
+        uint16_t *id = ASSERT_PTR(data);
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         r = parse_vlanid(rvalue, id);
         if (r == -ERANGE) {

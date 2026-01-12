@@ -1,13 +1,13 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 
 <!--
   SPDX-License-Identifier: LGPL-2.1-or-later
   Copyright © 2014 Jason St. John
 -->
 
-<refentry id="udev">
+<refentry id="udev" xmlns:xi="http://www.w3.org/2001/XInclude">
   <refentryinfo>
     <title>udev</title>
     <productname>systemd</productname>
@@ -51,7 +51,7 @@
       <filename>/usr/lib/udev/rules.d</filename> and <filename>/usr/local/lib/udev/rules.d</filename>, the
       volatile runtime directory <filename>/run/udev/rules.d</filename> and the local administration
       directory <filename>/etc/udev/rules.d</filename>.  All rules files are collectively sorted and
-      processed in lexical order, regardless of the directories in which they live. However, files with
+      processed in lexicographic order, regardless of the directories in which they live. However, files with
       identical filenames replace each other. Files in <filename>/etc/</filename> have the highest priority,
       files in <filename>/run/</filename> take precedence over files with the same name under
       <filename>/usr/</filename>. This can be used to override a system-supplied rules file with a local
@@ -79,14 +79,16 @@
           <varlistentry>
             <term><literal>==</literal></term>
             <listitem>
-              <para>Compare for equality.</para>
+              <para>Compare for equality. (The specified key has the specified value.)</para>
             </listitem>
           </varlistentry>
 
           <varlistentry>
             <term><literal>!=</literal></term>
             <listitem>
-              <para>Compare for inequality.</para>
+              <para>Compare for inequality. (The specified key does not have the specified value, or the
+              specified key is not present at all.)
+              </para>
             </listitem>
           </varlistentry>
 
@@ -109,13 +111,17 @@
             <term><literal>-=</literal></term>
             <listitem>
               <para>Remove the value from a key that holds a list of entries.</para>
+
+            <xi:include href="version-info.xml" xpointer="v217"/>
             </listitem>
           </varlistentry>
 
           <varlistentry>
             <term><literal>:=</literal></term>
             <listitem>
-              <para>Assign  a  value  to  a key finally; disallow any later changes.</para>
+              <para>Assign a value to a key finally; disallow any later changes.</para>
+
+            <xi:include href="version-info.xml" xpointer="v247"/>
             </listitem>
           </varlistentry>
         </variablelist>
@@ -125,14 +131,21 @@
         <title>Values</title>
           <para>Values are written as double quoted strings, such as ("string").
           To include a quotation mark (") in the value, precede it by a backslash (\").
-          Any other occurrences of a character followed by a backslash are not further unescaped.
+          Any other occurrences of a backslash followed by a character are not unescaped.
           That is, "\t\n" is treated as four characters:
           backslash, lowercase t, backslash, lowercase n.</para>
 
           <para>The string can be prefixed with a lowercase e (e"string\n") to mark the string as
-          <ulink url="https://en.wikipedia.org/wiki/Escape_sequences_in_C#Table_of_escape_sequences">C-style escaped</ulink>.
+          C-style escaped, see
+          <ulink url="https://en.wikipedia.org/wiki/Escape_sequences_in_C#Table_of_escape_sequences">Escape sequences in C</ulink>.
           For example, e"string\n" is parsed as 7 characters: 6 lowercase letters and a newline.
           This can be useful for writing special characters when a kernel driver requires them.</para>
+
+          <para>The string can be prefixed with a lowercase i (i"string") to mark that the string or pattern
+          will match case-insensitively. For example, i"foo" will match
+          <literal>foo</literal>, <literal>FOO</literal>, <literal>FoO</literal> and so on. The prefix can be
+          used only for match (<literal>==</literal>) or unmatch (<literal>!=</literal>) rules, e.g.
+          <varname>ATTR{foo}==i"abcd"</varname>.</para>
 
           <para>Please note that <constant>NUL</constant> is not allowed in either string variant.</para>
       </refsect2>
@@ -167,6 +180,13 @@
           </varlistentry>
 
           <varlistentry>
+            <term><varname>KERNELS</varname></term>
+            <listitem>
+              <para>Search the devpath upwards for a matching device name.</para>
+            </listitem>
+          </varlistentry>
+
+          <varlistentry>
             <term><varname>NAME</varname></term>
             <listitem>
               <para>Match the name of a network interface. It can be used once the
@@ -177,10 +197,10 @@
           <varlistentry>
             <term><varname>SYMLINK</varname></term>
             <listitem>
-              <para>Match the name of a symlink targeting the node. It can
-              be used once a SYMLINK key has been set in one of the preceding
-              rules. There may be multiple symlinks; only one needs to match.
-              </para>
+              <para>Match the name of a symlink targeting the node. It can be used once a SYMLINK key has
+              been set in one of the preceding rules. There may be multiple symlinks; only one needs to
+              match. If the operator is <literal>!=</literal>, the token returns true only if there is no
+              symlink matched.</para>
             </listitem>
           </varlistentry>
 
@@ -188,36 +208,6 @@
             <term><varname>SUBSYSTEM</varname></term>
             <listitem>
               <para>Match the subsystem of the event device.</para>
-            </listitem>
-          </varlistentry>
-          <varlistentry>
-            <term><varname>DRIVER</varname></term>
-            <listitem>
-              <para>Match the driver name of the event device. Only set this key for devices
-              which are bound to a driver at the time the event is generated.</para>
-            </listitem>
-          </varlistentry>
-          <varlistentry>
-            <term><varname>ATTR{<replaceable>filename</replaceable>}</varname></term>
-            <listitem>
-              <para>Match sysfs attribute values of the event device. Trailing
-              whitespace in the attribute values is ignored unless the specified match
-              value itself contains trailing whitespace.
-              </para>
-            </listitem>
-          </varlistentry>
-          <varlistentry>
-            <term><varname>SYSCTL{<replaceable>kernel parameter</replaceable>}</varname></term>
-            <listitem>
-              <para>Match a kernel parameter value.
-              </para>
-            </listitem>
-          </varlistentry>
-
-          <varlistentry>
-            <term><varname>KERNELS</varname></term>
-            <listitem>
-              <para>Search the devpath upwards for a matching device name.</para>
             </listitem>
           </varlistentry>
 
@@ -229,6 +219,14 @@
           </varlistentry>
 
           <varlistentry>
+            <term><varname>DRIVER</varname></term>
+            <listitem>
+              <para>Match the driver name of the event device. Only set this key for devices
+              which are bound to a driver at the time the event is generated.</para>
+            </listitem>
+          </varlistentry>
+
+          <varlistentry>
             <term><varname>DRIVERS</varname></term>
             <listitem>
               <para>Search the devpath upwards for a matching device driver name.</para>
@@ -236,19 +234,33 @@
           </varlistentry>
 
           <varlistentry>
-            <term><varname>ATTRS{<replaceable>filename</replaceable>}</varname></term>
+            <term><varname>ATTR{<replaceable>filename</replaceable>}</varname></term>
             <listitem>
-              <para>Search the devpath upwards for a device with matching sysfs attribute values.
-              If multiple <varname>ATTRS</varname> matches are specified, all of them
-              must match on the same device. Trailing whitespace in the attribute values is ignored
-              unless the specified match value itself contains trailing whitespace.</para>
+              <para>Match sysfs attribute value of the event device.</para>
+
+              <para>Trailing whitespace in the attribute values is ignored unless the specified match value
+              itself contains trailing whitespace.</para>
             </listitem>
           </varlistentry>
 
           <varlistentry>
-            <term><varname>TAGS</varname></term>
+            <term><varname>ATTRS{<replaceable>filename</replaceable>}</varname></term>
             <listitem>
-              <para>Search the devpath upwards for a device with matching tag.</para>
+              <para>Search the devpath upwards for a device with matching sysfs attribute values. If
+              multiple <varname>ATTRS</varname> matches are specified, all of them must match on the same
+              device.</para>
+
+              <para>Trailing whitespace in the attribute values is ignored unless the specified match value
+              itself contains trailing whitespace.</para>
+            </listitem>
+          </varlistentry>
+
+          <varlistentry>
+            <term><varname>SYSCTL{<replaceable>kernel parameter</replaceable>}</varname></term>
+            <listitem>
+              <para>Match a kernel parameter value.</para>
+
+            <xi:include href="version-info.xml" xpointer="v240"/>
             </listitem>
           </varlistentry>
 
@@ -270,6 +282,8 @@
                     <para>System's architecture. See <option>ConditionArchitecture=</option> in
                     <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>
                     for possible values.</para>
+
+                  <xi:include href="version-info.xml" xpointer="v244"/>
                   </listitem>
                 </varlistentry>
                 <varlistentry>
@@ -278,17 +292,41 @@
                     <para>System's virtualization environment. See
                     <citerefentry><refentrytitle>systemd-detect-virt</refentrytitle><manvolnum>1</manvolnum></citerefentry>
                     for possible values.</para>
+
+                    <xi:include href="version-info.xml" xpointer="v244"/>
+                  </listitem>
+                </varlistentry>
+                <varlistentry>
+                  <term><literal>cvm</literal></term>
+                  <listitem>
+                    <para>System's confidential virtualization technology. See
+                    <citerefentry><refentrytitle>systemd-detect-virt</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+                    for possible values.</para>
+
+                    <xi:include href="version-info.xml" xpointer="v254"/>
                   </listitem>
                 </varlistentry>
               </variablelist>
               <para>Unknown keys will never match.</para>
+
+              <xi:include href="version-info.xml" xpointer="v244"/>
             </listitem>
           </varlistentry>
 
           <varlistentry>
             <term><varname>TAG</varname></term>
             <listitem>
-              <para>Match against a device tag.</para>
+              <para>Match against one of device tags. It can be used once a TAG key has been set in one of
+              the preceding rules. There may be multiple tags; only one needs to match. If the operator is
+              <literal>!=</literal>, the token returns true only if there is no tag matched.</para>
+            </listitem>
+          </varlistentry>
+
+          <varlistentry>
+            <term><varname>TAGS</varname></term>
+            <listitem>
+              <para>Search the devpath upwards for a device with matching tag. If the operator is
+              <literal>!=</literal>, the token returns true only if there is no tag matched.</para>
             </listitem>
           </varlistentry>
 
@@ -361,6 +399,8 @@
               <para>Separates alternative patterns. For example, the pattern string
               <literal>abc|x*</literal> would match either <literal>abc</literal>
               or <literal>x*</literal>.</para>
+
+              <xi:include href="version-info.xml" xpointer="v217"/>
             </listitem>
           </varlistentry>
         </variablelist>
@@ -412,6 +452,8 @@
             <term><varname>SECLABEL{<replaceable>module</replaceable>}</varname></term>
             <listitem>
               <para>Applies the specified Linux Security Module label to the device node.</para>
+
+            <xi:include href="version-info.xml" xpointer="v209"/>
             </listitem>
           </varlistentry>
 
@@ -427,6 +469,8 @@
             <term><varname>SYSCTL{<replaceable>kernel parameter</replaceable>}</varname></term>
             <listitem>
               <para>The value that should be written to kernel parameter.</para>
+
+            <xi:include href="version-info.xml" xpointer="v220"/>
             </listitem>
           </varlistentry>
 
@@ -459,7 +503,7 @@
               <para>Specify a program to be executed after processing of all the rules for the event. With
               <literal>+=</literal>, this invocation is added to the list, and with <literal>=</literal> or
               <literal>:=</literal>, it replaces any previous contents of the list. Please note that both
-              <literal>program</literal> and <literal>builtin</literal> types described below use a single
+              <literal>program</literal> and <literal>builtin</literal> types described below share a common
               list, so clearing the list with <literal>:=</literal> and <literal>=</literal> affects both
               types.</para>
 
@@ -481,6 +525,8 @@
                   <listitem>
                     <para>As <varname>program</varname>, but use one of the
                     built-in programs rather than an external one.</para>
+
+                  <xi:include href="version-info.xml" xpointer="v199"/>
                   </listitem>
                 </varlistentry>
               </variablelist>
@@ -533,6 +579,8 @@
                     import its output, which must be in environment key
                     format. Path specification, command/argument separation,
                     and quoting work like in <varname>RUN</varname>.</para>
+
+                    <xi:include href="version-info.xml" xpointer="v199"/>
                   </listitem>
                 </varlistentry>
                 <varlistentry>
@@ -540,6 +588,8 @@
                   <listitem>
                     <para>Similar to <literal>program</literal>, but use one of the
                     built-in programs rather than an external one.</para>
+
+                  <xi:include href="version-info.xml" xpointer="v199"/>
                   </listitem>
                 </varlistentry>
               <varlistentry>
@@ -601,9 +651,12 @@
                 <varlistentry>
                   <term><option>string_escape=<replaceable>none|replace</replaceable></option></term>
                   <listitem>
-                    <para>Usually, control and other possibly unsafe characters are replaced
-                    in strings used for device naming. The mode of replacement can be specified
-                    with this option.</para>
+                    <para>When <literal>replace</literal>, possibly unsafe characters in strings
+                    assigned to <varname>NAME</varname>, <varname>SYMLINK</varname>, and
+                    <varname>ENV{<replaceable>key</replaceable>}</varname> are replaced. When
+                    <literal>none</literal>, no replacement is performed. When unset, the replacement
+                    is performed for <varname>NAME</varname>, <varname>SYMLINK</varname>, but not for
+                    <varname>ENV{<replaceable>key</replaceable>}</varname>. Defaults to unset.</para>
                   </listitem>
                 </varlistentry>
                 <varlistentry>
@@ -638,13 +691,13 @@
                 <varlistentry>
                   <term><option>db_persist</option></term>
                   <listitem>
-                    <para>Set the flag (sticky bit) on the udev database entry
-                    of the event device. Device properties are then kept in the
-                    database even when
-                    <command>udevadm info --cleanup-db</command> is called.
-                    This option can be useful in certain cases
-                    (e.g. Device Mapper devices) for persisting device state
-                    on the transition from initramfs.</para>
+                    <para>Set the flag (sticky bit) on the udev database entry of the event device. Device
+                    properties are then kept in the database even when <command>udevadm info
+                    --cleanup-db</command> is called.  This option can be useful in certain cases
+                    (e.g. Device Mapper devices) for persisting device state on the transition from
+                    initrd.</para>
+
+                    <xi:include href="version-info.xml" xpointer="v241"/>
                   </listitem>
                 </varlistentry>
                 <varlistentry>
@@ -660,9 +713,28 @@
                     log level is applied when the line including this rule is processed. So, for
                     debugging, it is recommended that this is specified at earlier place, e.g., the
                     first line of <filename>00-debug.rules</filename>.</para>
-                    <para>Example for debugging uevent processing for network interfaces.
+                    <para>Example for debugging uevent processing for network interfaces:
                     <programlisting># /etc/udev/rules.d/00-debug-net.rules
 SUBSYSTEM=="net", OPTIONS="log_level=debug"</programlisting></para>
+
+                    <xi:include href="version-info.xml" xpointer="v248"/>
+                  </listitem>
+                </varlistentry>
+                <varlistentry>
+                  <term><option>dump</option></term>
+                  <listitem>
+                    <para>Dump the status of the event currently processing. It may be useful for debugging
+                    udev rules by inserting this option.</para>
+
+                    <xi:include href="version-info.xml" xpointer="v258"/>
+                  </listitem>
+                </varlistentry>
+                <varlistentry>
+                  <term><option>dump-json</option></term>
+                  <listitem>
+                    <para>Similar to <option>dump</option>, but dump the status of the event in JSON format.</para>
+
+                    <xi:include href="version-info.xml" xpointer="v259"/>
                   </listitem>
                 </varlistentry>
               </variablelist>
@@ -670,15 +742,16 @@ SUBSYSTEM=="net", OPTIONS="log_level=debug"</programlisting></para>
           </varlistentry>
         </variablelist>
 
-        <para>The <varname>NAME</varname>, <varname>SYMLINK</varname>,
-        <varname>PROGRAM</varname>, <varname>OWNER</varname>,
-        <varname>GROUP</varname>, <varname>MODE</varname>, <varname>SECLABEL</varname>,
-        and <varname>RUN</varname> fields support simple string substitutions.
+        <para>The <varname>ENV</varname>, <varname>GROUP</varname>,
+        <varname>MODE</varname>, <varname>NAME</varname>,
+        <varname>OWNER</varname>, <varname>PROGRAM</varname>,
+        <varname>RUN</varname>, <varname>SECLABEL</varname>, and
+        <varname>SYMLINK</varname> fields support simple string substitutions.
         The <varname>RUN</varname> substitutions are performed after all rules
         have been processed, right before the program is executed, allowing for
-        the use of device properties set by earlier matching rules. For all other
-        fields, substitutions are performed while the individual rule is being
-        processed. The available substitutions are:</para>
+        the use of device properties set by earlier matching rules. For all
+        other fields, substitutions are performed while the individual rule is
+        being processed. The available substitutions are:</para>
         <variablelist class='udev-directives'>
           <varlistentry>
             <term><option>$kernel</option>, <option>%k</option></term>
@@ -835,16 +908,16 @@ SUBSYSTEM=="net", OPTIONS="log_level=debug"</programlisting></para>
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry>
+    <para><simplelist type="inline">
+      <member><citerefentry>
         <refentrytitle>systemd-udevd.service</refentrytitle><manvolnum>8</manvolnum>
-      </citerefentry>,
-      <citerefentry>
+      </citerefentry></member>
+      <member><citerefentry>
         <refentrytitle>udevadm</refentrytitle><manvolnum>8</manvolnum>
-      </citerefentry>,
-      <citerefentry>
+      </citerefentry></member>
+      <member><citerefentry>
         <refentrytitle>systemd.link</refentrytitle><manvolnum>5</manvolnum>
-      </citerefentry>
-    </para>
+      </citerefentry></member>
+    </simplelist></para>
   </refsect1>
 </refentry>

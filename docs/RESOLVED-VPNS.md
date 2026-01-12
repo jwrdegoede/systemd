@@ -2,6 +2,7 @@
 title: systemd-resolved and VPNs
 category: Networking
 layout: default
+SPDX-License-Identifier: LGPL-2.1-or-later
 ---
 
 # `systemd-resolved.service` and VPNs
@@ -47,25 +48,25 @@ a network interface may configure.
 
 2. Routing domains: these are very similar to search domains, but are purely
    about DNS domain name lookup routing — they are not used for qualifying
-   single-label domain names. When it comes to routing assigning a routing
+   single-label domain names. When it comes to routing, assigning a routing
    domain to a network interface is identical to assigning a search domain to
    it.
 
    Why the need to have both concepts, i.e. search *and* routing domains?
    Mostly because in many cases the qualifying of single-label names is not
-   desirable (since security-sensitive), but needs to be supported for specific
-   use-cases. Routing domains are a concept `systemd-resolved.service`
+   desirable (as it has security implications), but needs to be supported for
+   specific use-cases. Routing domains are a concept `systemd-resolved.service`
    introduced, while search domains are traditionally available and are part of
    DHCP/IPv6RA/PPP leases and thus universally supported. In many cases routing
    domains are probably the more appropriate concept, but not easily available,
-   since not part of DHCP/IPv6RA/PPP.
+   since they are not part of DHCP/IPv6RA/PPP.
 
    Routing domains for `systemd-resolved.service` are usually presented along
    with search domains in mostly the same way, but prefixed with `~` to
    differentiate them. i.e. `~foo.com` is a configured routing domain, while
    `foo.com` would be a configured search domain.
 
-   One routing domain is particular interesting: `~.` — the catch-all routing
+   One routing domain is particularly interesting: `~.` — the catch-all routing
    domain. (The *dot* domain `.` is how DNS denotes the "root" domain, i.e. the
    parent domain of all domains, but itself.) When used on an interface any DNS
    traffic is preferably routed to its DNS servers. (A search domain – i.e. `.`
@@ -78,7 +79,7 @@ a network interface may configure.
    these (or sub-domains thereof) defined as routing domains, will be preferably
    used for doing reverse IP to domain name lookups. e.g. declaring
    `~168.192.in-addr.arpa` on an interface means that all lookups to find the
-   domain names for IPv4 addresses 192.168.x.y are preferable routed to it.
+   domain names for IPv4 addresses 192.168.x.y are preferably routed to it.
 
 3. The `default-route` boolean. This is a simple boolean value that may be set
    on an interface. If true (the default), any DNS lookups for which no
@@ -111,7 +112,7 @@ and another one with `~corp.company.example` — both suffixes match a lookup fo
 `foo.corp.company.example`, but the latter interface wins, since the match is
 for four labels, while the other is for zero labels.
 
-# Putting it Together
+## Putting it Together
 
 Let's discuss how the three DNS routing concepts above are best used for a
 reasonably complex scenario consisting of:
@@ -158,7 +159,7 @@ else.  If `privacy0` is then downed again, `wifi0` will get the regular DNS
 traffic again, and `company0` will still get the company's internal domain and
 IP subnet traffic and nothing else. Everything hence works as intended.
 
-# How to Implement this in Your VPN Software
+## How to Implement this in Your VPN Software
 
 Most likely you want to expose a boolean in some way that declares whether a
 specific VPN is of the *corporate* or the *privacy* kind:
@@ -176,7 +177,7 @@ specific VPN is of the *corporate* or the *privacy* kind:
 traditional, i.e. with any search domains as acquired, do not set `~.` though,
 and do not disable `default-route`.)
 
-# The APIs
+## The APIs
 
 Now we determined how we want to configure things, but how do you actually get
 the configuration to `systemd-resolved.service`? There are three relevant
@@ -221,7 +222,7 @@ interfaces:
    propagate the `default-route` boolean, nor can be used to configure the
    `~….in-addr.arpa` or `~.ip6.arpa` routing domains.
 
-# Ordering
+## Ordering
 
 When configuring per-interface DNS configuration settings it is wise to
 configure everything *before* actually upping the interface. Once the interface
@@ -234,7 +235,7 @@ as the former without the latter has no effect, but the latter without the
 former will result in DNS traffic possibly being generated, in a non-desirable
 way given that the routing information is not set yet.
 
-# Downgrading Search Domains to Routing Domains
+## Downgrading Search Domains to Routing Domains
 
 Many VPN implementations provide a way how VPN servers can inform VPN clients
 about search domains to use. In some cases it might make sense to install those

@@ -1,35 +1,44 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <getopt.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 
 #include "sd-bus.h"
 
 #include "alloc-util.h"
+#include "build.h"
 #include "bus-error.h"
+#include "bus-locator.h"
 #include "bus-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "format-table.h"
-#include "format-util.h"
+#include "log.h"
 #include "main-func.h"
 #include "pager.h"
+#include "parse-argument.h"
+#include "pidref.h"
+#include "polkit-agent.h"
 #include "pretty-print.h"
 #include "process-util.h"
+#include "runtime-scope.h"
 #include "signal-util.h"
+#include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
 #include "user-util.h"
-#include "util.h"
 
-static const char* arg_what = "idle:sleep:shutdown";
-static const char* arg_who = NULL;
-static const char* arg_why = "Unknown reason";
-static const char* arg_mode = NULL;
+static const char *arg_what = NULL;
+static const char *arg_who = NULL;
+static const char *arg_why = NULL;
+static const char *arg_mode = NULL;
+static bool arg_ask_password = true;
 static PagerFlags arg_pager_flags = 0;
 static bool arg_legend = true;
+static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 
 static enum {
         ACTION_INHIBIT,
@@ -41,15 +50,9 @@ static int inhibit(sd_bus *bus, sd_bus_error *error) {
         int r;
         int fd;
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.login1",
-                        "/org/freedesktop/login1",
-                        "org.freedesktop.login1.Manager",
-                        "Inhibit",
-                        error,
-                        &reply,
-                        "ssss", arg_what, arg_who, arg_why, arg_mode);
+        (void) polkit_agent_open_if_enabled(BUS_TRANSPORT_LOCAL, arg_ask_password);
+
+        r = bus_call_method(bus, bus_login_mgr, "Inhibit", error, &reply, "ssss", arg_what, arg_who, arg_why, arg_mode);
         if (r < 0)
                 return r;
 
@@ -57,30 +60,20 @@ static int inhibit(sd_bus *bus, sd_bus_error *error) {
         if (r < 0)
                 return r;
 
-        r = fcntl(fd, F_DUPFD_CLOEXEC, 3);
-        if (r < 0)
-                return -errno;
-
-        return r;
+        return RET_NERRNO(fcntl(fd, F_DUPFD_CLOEXEC, 3));
 }
 
 static int print_inhibitors(sd_bus *bus) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_(table_unrefp) Table *table = NULL;
+        _cleanup_strv_free_ char **what_filter = NULL;
+
         int r;
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.login1",
-                        "/org/freedesktop/login1",
-                        "org.freedesktop.login1.Manager",
-                        "ListInhibitors",
-                        &error,
-                        &reply,
-                        "");
+        r = bus_call_method(bus, bus_login_mgr, "ListInhibitors", &error, &reply, NULL);
         if (r < 0)
                 return log_error_errno(r, "Could not get active inhibitors: %s", bus_error_message(&error, r));
 
@@ -90,10 +83,17 @@ static int print_inhibitors(sd_bus *bus) {
 
         /* If there's not enough space, shorten the "WHY" column, as it's little more than an explaining comment. */
         (void) table_set_weight(table, TABLE_HEADER_CELL(6), 20);
+        (void) table_set_maximum_width(table, TABLE_HEADER_CELL(0), columns()/2);
 
         r = sd_bus_message_enter_container(reply, SD_BUS_TYPE_ARRAY, "(ssssuu)");
         if (r < 0)
                 return bus_log_parse_error(r);
+
+        if (arg_what) {
+                what_filter = strv_split(arg_what, ":");
+                if (!what_filter)
+                        return log_oom();
+        }
 
         for (;;) {
                 _cleanup_free_ char *comm = NULL, *u = NULL;
@@ -106,10 +106,29 @@ static int print_inhibitors(sd_bus *bus) {
                 if (r == 0)
                         break;
 
+                if (what_filter) {
+                        bool skip = false;
+
+                        STRV_FOREACH(op, what_filter)
+                                if (!string_contains_word(what, ":", *op)) {
+                                        skip = true;
+                                        break;
+                                }
+
+                        if (skip)
+                                continue;
+                }
+
+                if (arg_who && !streq(who, arg_who))
+                        continue;
+
+                if (arg_why && fnmatch(arg_why, why, FNM_CASEFOLD) != 0)
+                        continue;
+
                 if (arg_mode && !streq(mode, arg_mode))
                         continue;
 
-                (void) get_process_comm(pid, &comm);
+                (void) pid_get_comm(pid, &comm);
                 u = uid_to_name(uid);
 
                 r = table_add_many(table,
@@ -129,23 +148,23 @@ static int print_inhibitors(sd_bus *bus) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        if (table_get_rows(table) > 1) {
-                r = table_set_sort(table, (size_t) 1, (size_t) 0, (size_t) 5, (size_t) 6, (size_t) -1);
+        if (!table_isempty(table)) {
+                r = table_set_sort(table, (size_t) 1, (size_t) 0, (size_t) 5, (size_t) 6);
                 if (r < 0)
                         return table_log_sort_error(r);
 
                 table_set_header(table, arg_legend);
 
-                r = table_print(table, NULL);
+                r = table_print_with_pager(table, arg_json_format_flags, arg_pager_flags, arg_legend);
                 if (r < 0)
-                        return table_log_print_error(r);
+                        return r;
         }
 
-        if (arg_legend) {
-                if (table_get_rows(table) > 1)
-                        printf("\n%zu inhibitors listed.\n", table_get_rows(table) - 1);
-                else
+        if (arg_legend && !sd_json_format_enabled(arg_json_format_flags)) {
+                if (table_isempty(table))
                         printf("No inhibitors.\n");
+                else
+                        printf("\n%zu inhibitors listed.\n", table_get_rows(table) - 1);
         }
 
         return 0;
@@ -163,21 +182,24 @@ static int help(void) {
                "\n%sExecute a process while inhibiting shutdown/sleep/idle.%s\n\n"
                "  -h --help               Show this help\n"
                "     --version            Show package version\n"
+               "     --no-ask-password    Do not attempt interactive authorization\n"
                "     --no-pager           Do not pipe output into a pager\n"
                "     --no-legend          Do not show the headers and footers\n"
+               "     --json=pretty|short|off\n"
+               "                          Generate JSON output\n"
                "     --what=WHAT          Operations to inhibit, colon separated list of:\n"
                "                          shutdown, sleep, idle, handle-power-key,\n"
                "                          handle-suspend-key, handle-hibernate-key,\n"
                "                          handle-lid-switch\n"
                "     --who=STRING         A descriptive string who is inhibiting\n"
                "     --why=STRING         A descriptive string why is being inhibited\n"
-               "     --mode=MODE          One of block or delay\n"
+               "     --mode=MODE          One of block, block-weak, or delay\n"
                "     --list               List active inhibitors\n"
-               "\nSee the %s for details.\n"
-               , program_invocation_short_name
-               , ansi_highlight(), ansi_normal()
-               , link
-        );
+               "\nSee the %s for details.\n",
+               program_invocation_short_name,
+               ansi_highlight(),
+               ansi_normal(),
+               link);
 
         return 0;
 }
@@ -191,28 +213,35 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_WHY,
                 ARG_MODE,
                 ARG_LIST,
+                ARG_NO_ASK_PASSWORD,
                 ARG_NO_PAGER,
                 ARG_NO_LEGEND,
+                ARG_JSON,
         };
 
         static const struct option options[] = {
-                { "help",         no_argument,       NULL, 'h'              },
-                { "version",      no_argument,       NULL, ARG_VERSION      },
-                { "what",         required_argument, NULL, ARG_WHAT         },
-                { "who",          required_argument, NULL, ARG_WHO          },
-                { "why",          required_argument, NULL, ARG_WHY          },
-                { "mode",         required_argument, NULL, ARG_MODE         },
-                { "list",         no_argument,       NULL, ARG_LIST         },
-                { "no-pager",     no_argument,       NULL, ARG_NO_PAGER     },
-                { "no-legend",    no_argument,       NULL, ARG_NO_LEGEND       },
+                { "help",             no_argument,       NULL, 'h'                 },
+                { "version",          no_argument,       NULL, ARG_VERSION         },
+                { "no-ask-password",  no_argument,       NULL, ARG_NO_ASK_PASSWORD },
+                { "what",             required_argument, NULL, ARG_WHAT            },
+                { "who",              required_argument, NULL, ARG_WHO             },
+                { "why",              required_argument, NULL, ARG_WHY             },
+                { "mode",             required_argument, NULL, ARG_MODE            },
+                { "list",             no_argument,       NULL, ARG_LIST            },
+                { "no-pager",         no_argument,       NULL, ARG_NO_PAGER        },
+                { "no-legend",        no_argument,       NULL, ARG_NO_LEGEND       },
+                { "json",             required_argument, NULL, ARG_JSON            },
                 {}
         };
 
-        int c;
+        int c, r;
 
         assert(argc >= 0);
         assert(argv);
 
+        /* Resetting to 0 forces the invocation of an internal initialization routine of getopt_long()
+         * that checks for GNU extensions in optstring ('-' or '+' at the beginning). */
+        optind = 0;
         while ((c = getopt_long(argc, argv, "+h", options, NULL)) >= 0)
 
                 switch (c) {
@@ -243,6 +272,10 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_action = ACTION_LIST;
                         break;
 
+                case ARG_NO_ASK_PASSWORD:
+                        arg_ask_password = false;
+                        break;
+
                 case ARG_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
@@ -251,11 +284,18 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_legend = false;
                         break;
 
+                case ARG_JSON:
+                        r = parse_json_argument(optarg, &arg_json_format_flags);
+                        if (r <= 0)
+                                return r;
+
+                        break;
+
                 case '?':
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unhandled option");
+                        assert_not_reached();
                 }
 
         if (arg_action == ACTION_INHIBIT && optind == argc)
@@ -272,9 +312,7 @@ static int run(int argc, char *argv[]) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
-        log_show_color(true);
-        log_parse_environment();
-        log_open();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
@@ -282,7 +320,9 @@ static int run(int argc, char *argv[]) {
 
         r = sd_bus_default_system(&bus);
         if (r < 0)
-                return bus_log_connect_error(r);
+                return bus_log_connect_error(r, BUS_TRANSPORT_LOCAL, RUNTIME_SCOPE_SYSTEM);
+
+        (void) sd_bus_set_allow_interactive_authorization(bus, arg_ask_password);
 
         if (arg_action == ACTION_LIST)
                 return print_inhibitors(bus);
@@ -290,11 +330,13 @@ static int run(int argc, char *argv[]) {
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
                 _cleanup_strv_free_ char **arguments = NULL;
                 _cleanup_free_ char *w = NULL;
-                _cleanup_close_ int fd = -1;
-                pid_t pid;
+                _cleanup_close_ int fd = -EBADF;
 
                 /* Ignore SIGINT and allow the forked process to receive it */
-                (void) ignore_signals(SIGINT, -1);
+                (void) ignore_signals(SIGINT);
+
+                if (!arg_what)
+                        arg_what = "idle:sleep:shutdown";
 
                 if (!arg_who) {
                         w = strv_join(argv + optind, " ");
@@ -303,6 +345,9 @@ static int run(int argc, char *argv[]) {
 
                         arg_who = w;
                 }
+
+                if (!arg_why)
+                        arg_why = "Unknown reason";
 
                 if (!arg_mode)
                         arg_mode = "block";
@@ -315,18 +360,19 @@ static int run(int argc, char *argv[]) {
                 if (!arguments)
                         return log_oom();
 
-                r = safe_fork("(inhibit)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_CLOSE_ALL_FDS|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pid);
+                _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+                r = pidref_safe_fork("(inhibit)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_CLOSE_ALL_FDS|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pidref);
                 if (r < 0)
                         return r;
                 if (r == 0) {
                         /* Child */
                         execvp(arguments[0], arguments);
                         log_open();
-                        log_error_errno(errno, "Failed to execute %s: %m", argv[optind]);
+                        log_error_errno(errno, "Failed to execute '%s': %m", arguments[0]);
                         _exit(EXIT_FAILURE);
                 }
 
-                return wait_for_terminate_and_check(argv[optind], pid, WAIT_LOG);
+                return pidref_wait_for_terminate_and_check(argv[optind], &pidref, WAIT_LOG_ABNORMAL);
         }
 }
 

@@ -1,13 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <netinet/in.h>
 #include <linux/if_macsec.h>
+#include <net/ethernet.h>
 
-#include "ether-addr-util.h"
-#include "in-addr-util.h"
+#include "shared-forward.h"
 #include "netdev.h"
-#include "networkd-util.h"
 #include "sparse-endian.h"
 
 /* See the definition of MACSEC_NUM_AN in kernel's drivers/net/macsec.c */
@@ -39,14 +37,14 @@ typedef struct SecurityAssociation {
 
 typedef struct TransmitAssociation {
         MACsec *macsec;
-        NetworkConfigSection *section;
+        ConfigSection *section;
 
         SecurityAssociation sa;
 } TransmitAssociation;
 
 typedef struct ReceiveAssociation {
         MACsec *macsec;
-        NetworkConfigSection *section;
+        ConfigSection *section;
 
         MACsecSCI sci;
         SecurityAssociation sa;
@@ -54,14 +52,14 @@ typedef struct ReceiveAssociation {
 
 typedef struct ReceiveChannel {
         MACsec *macsec;
-        NetworkConfigSection *section;
+        ConfigSection *section;
 
         MACsecSCI sci;
         ReceiveAssociation *rxsa[MACSEC_MAX_ASSOCIATION_NUMBER];
         unsigned n_rxsa;
 } ReceiveChannel;
 
-struct MACsec {
+typedef struct MACsec {
         NetDev meta;
 
         uint16_t port;
@@ -72,7 +70,7 @@ struct MACsec {
         OrderedHashmap *receive_channels_by_section;
         OrderedHashmap *transmit_associations_by_section;
         OrderedHashmap *receive_associations_by_section;
-};
+} MACsec;
 
 DEFINE_NETDEV_CAST(MACSEC, MACsec);
 extern const NetDevVTable macsec_vtable;

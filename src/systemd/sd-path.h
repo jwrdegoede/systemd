@@ -14,16 +14,14 @@
   Lesser General Public License for more details.
 
   You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  along with systemd; If not, see <https://www.gnu.org/licenses/>.
 ***/
-
-#include <inttypes.h>
 
 #include "_sd-common.h"
 
 _SD_BEGIN_DECLARATIONS;
 
-enum {
+__extension__ enum {
         /* Temporary files */
         SD_PATH_TEMPORARY,
         SD_PATH_TEMPORARY_LARGE,
@@ -46,6 +44,9 @@ enum {
         SD_PATH_SYSTEM_STATE_CACHE,
         SD_PATH_SYSTEM_STATE_SPOOL,
 
+        /* generic system configuration */
+        SD_PATH_SYSTEM_SEARCH_CONFIGURATION,
+
         /* Vendor supplied data */
         SD_PATH_USER_BINARIES,
         SD_PATH_USER_LIBRARY_PRIVATE,
@@ -53,9 +54,10 @@ enum {
         SD_PATH_USER_SHARED,
 
         /* User configuration, state, runtime ... */
-        SD_PATH_USER_CONFIGURATION, /* takes both actual configuration (like /etc) and state (like /var/lib) */
+        SD_PATH_USER_CONFIGURATION,
         SD_PATH_USER_RUNTIME,
         SD_PATH_USER_STATE_CACHE,
+        /* → SD_PATH_USER_STATE_PRIVATE is added at the bottom */
 
         /* User resources */
         SD_PATH_USER, /* $HOME itself */
@@ -82,12 +84,14 @@ enum {
          * replaces "path" by "search"), since this API is about dirs/paths anyway, and contains "path"
          * already in the prefix */
         SD_PATH_SYSTEMD_UTIL,
+
         SD_PATH_SYSTEMD_SYSTEM_UNIT,
         SD_PATH_SYSTEMD_SYSTEM_PRESET,
         SD_PATH_SYSTEMD_SYSTEM_CONF,
         SD_PATH_SYSTEMD_USER_UNIT,
         SD_PATH_SYSTEMD_USER_PRESET,
         SD_PATH_SYSTEMD_USER_CONF,
+        SD_PATH_SYSTEMD_INITRD_PRESET,
 
         SD_PATH_SYSTEMD_SEARCH_SYSTEM_UNIT,
         SD_PATH_SYSTEMD_SEARCH_USER_UNIT,
@@ -110,11 +114,30 @@ enum {
         /* systemd-networkd search paths */
         SD_PATH_SYSTEMD_SEARCH_NETWORK,
 
+        /* systemd environment generators */
+        SD_PATH_SYSTEMD_SYSTEM_ENVIRONMENT_GENERATOR,
+        SD_PATH_SYSTEMD_USER_ENVIRONMENT_GENERATOR,
+        SD_PATH_SYSTEMD_SEARCH_SYSTEM_ENVIRONMENT_GENERATOR,
+        SD_PATH_SYSTEMD_SEARCH_USER_ENVIRONMENT_GENERATOR,
+
+        SD_PATH_USER_STATE_PRIVATE,
+
+        /* credential store */
+        SD_PATH_SYSTEM_CREDENTIAL_STORE,
+        SD_PATH_SYSTEM_SEARCH_CREDENTIAL_STORE,
+        SD_PATH_SYSTEM_CREDENTIAL_STORE_ENCRYPTED,
+        SD_PATH_SYSTEM_SEARCH_CREDENTIAL_STORE_ENCRYPTED,
+        SD_PATH_USER_CREDENTIAL_STORE,
+        SD_PATH_USER_SEARCH_CREDENTIAL_STORE,
+        SD_PATH_USER_CREDENTIAL_STORE_ENCRYPTED,
+        SD_PATH_USER_SEARCH_CREDENTIAL_STORE_ENCRYPTED,
+
         _SD_PATH_MAX,
+        _SD_PATH_INVALID = UINT64_MAX
 };
 
-int sd_path_lookup(uint64_t type, const char *suffix, char **path);
-int sd_path_lookup_strv(uint64_t type, const char *suffix, char ***paths);
+int sd_path_lookup(uint64_t type, const char *suffix, char **ret);
+int sd_path_lookup_strv(uint64_t type, const char *suffix, char ***ret);
 
 _SD_END_DECLARATIONS;
 

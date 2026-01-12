@@ -1,15 +1,22 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <linux/if_arp.h>
+#include <netinet/in.h>
+
+#include "sd-netlink.h"
+
 #include "alloc-util.h"
 #include "bond.h"
 #include "bond-util.h"
 #include "conf-parser.h"
 #include "ether-addr-util.h"
 #include "extract-word.h"
-#include "netlink-util.h"
-#include "networkd-manager.h"
-#include "string-table.h"
-
+#include "in-addr-util.h"
+#include "networkd-link.h"
+#include "ordered-set.h"
+#include "set.h"
+#include "string-util.h"
+#include "time-util.h"
 /*
  * Number of seconds between instances where the bonding
  * driver sends learning packets to each slaves peer switch
@@ -41,163 +48,182 @@
 #define GRATUITOUS_ARP_MAX        255
 #define GRATUITOUS_ARP_DEFAULT    1
 
-DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_mode, bond_mode, BondMode, "Failed to parse bond mode");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_mode, bond_mode, BondMode);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_xmit_hash_policy,
                          bond_xmit_hash_policy,
-                         BondXmitHashPolicy,
-                         "Failed to parse bond transmit hash policy");
-DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_lacp_rate, bond_lacp_rate, BondLacpRate, "Failed to parse bond lacp rate");
-DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_ad_select, bond_ad_select, BondAdSelect, "Failed to parse bond AD select");
-DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_fail_over_mac, bond_fail_over_mac, BondFailOverMac, "Failed to parse bond fail over MAC");
-DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_arp_validate, bond_arp_validate, BondArpValidate, "Failed to parse bond arp validate");
-DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_arp_all_targets, bond_arp_all_targets, BondArpAllTargets, "Failed to parse bond Arp all targets");
-DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_primary_reselect, bond_primary_reselect, BondPrimaryReselect, "Failed to parse bond primary reselect");
+                         BondXmitHashPolicy);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_lacp_rate, bond_lacp_rate, BondLacpRate);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_ad_select, bond_ad_select, BondAdSelect);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_fail_over_mac, bond_fail_over_mac, BondFailOverMac);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_arp_validate, bond_arp_validate, BondArpValidate);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_arp_all_targets, bond_arp_all_targets, BondArpAllTargets);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_primary_reselect, bond_primary_reselect, BondPrimaryReselect);
 
 static int netdev_bond_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *m) {
-        Bond *b;
+        Bond *b = BOND(netdev);
         int r;
 
-        assert(netdev);
+        assert(netdev->manager);
         assert(!link);
         assert(m);
 
-        b = BOND(netdev);
+        if (netdev->ifindex > 0) {
+                r = link_get_by_index(netdev->manager, netdev->ifindex, &link);
+                if (r < 0)
+                        return r;
+        }
 
-        assert(b);
+        bool up = link && FLAGS_SET(link->flags, IFF_UP);
+        bool has_slaves = link && !set_isempty(link->slaves);
 
-        if (b->mode != _NETDEV_BOND_MODE_INVALID) {
+        if (b->mode != _NETDEV_BOND_MODE_INVALID && !up && !has_slaves) {
                 r = sd_netlink_message_append_u8(m, IFLA_BOND_MODE, b->mode);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_MODE attribute: %m");
+                        return r;
         }
 
         if (b->xmit_hash_policy != _NETDEV_BOND_XMIT_HASH_POLICY_INVALID) {
                 r = sd_netlink_message_append_u8(m, IFLA_BOND_XMIT_HASH_POLICY, b->xmit_hash_policy);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_XMIT_HASH_POLICY attribute: %m");
+                        return r;
         }
 
         if (b->lacp_rate != _NETDEV_BOND_LACP_RATE_INVALID &&
-            b->mode == NETDEV_BOND_MODE_802_3AD) {
+            b->mode == NETDEV_BOND_MODE_802_3AD &&
+            !up) {
                 r = sd_netlink_message_append_u8(m, IFLA_BOND_AD_LACP_RATE, b->lacp_rate);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_AD_LACP_RATE attribute: %m");
+                        return r;
         }
 
         if (b->miimon != 0) {
                 r = sd_netlink_message_append_u32(m, IFLA_BOND_MIIMON, b->miimon / USEC_PER_MSEC);
                 if (r < 0)
-                        log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_BOND_MIIMON attribute: %m");
+                        return r;
+        }
+
+        if (b->peer_notify_delay != 0) {
+                r = sd_netlink_message_append_u32(m, IFLA_BOND_PEER_NOTIF_DELAY, b->peer_notify_delay / USEC_PER_MSEC);
+                if (r < 0)
+                        return r;
         }
 
         if (b->downdelay != 0) {
                 r = sd_netlink_message_append_u32(m, IFLA_BOND_DOWNDELAY, b->downdelay / USEC_PER_MSEC);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_DOWNDELAY attribute: %m");
+                        return r;
         }
 
         if (b->updelay != 0) {
                 r = sd_netlink_message_append_u32(m, IFLA_BOND_UPDELAY, b->updelay / USEC_PER_MSEC);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_UPDELAY attribute: %m");
+                        return r;
         }
 
         if (b->arp_interval != 0) {
                 r = sd_netlink_message_append_u32(m, IFLA_BOND_ARP_INTERVAL, b->arp_interval / USEC_PER_MSEC);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_ARP_INTERVAL attribute: %m");
+                        return r;
 
                 if (b->lp_interval >= LEARNING_PACKETS_INTERVAL_MIN_SEC &&
                     b->lp_interval <= LEARNING_PACKETS_INTERVAL_MAX_SEC) {
                         r = sd_netlink_message_append_u32(m, IFLA_BOND_LP_INTERVAL, b->lp_interval / USEC_PER_SEC);
                         if (r < 0)
-                                return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_LP_INTERVAL attribute: %m");
+                                return r;
                 }
         }
 
         if (b->ad_select != _NETDEV_BOND_AD_SELECT_INVALID &&
-            b->mode == NETDEV_BOND_MODE_802_3AD) {
+            b->mode == NETDEV_BOND_MODE_802_3AD &&
+            !up) {
                 r = sd_netlink_message_append_u8(m, IFLA_BOND_AD_SELECT, b->ad_select);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_AD_SELECT attribute: %m");
+                        return r;
         }
 
         if (b->fail_over_mac != _NETDEV_BOND_FAIL_OVER_MAC_INVALID &&
-            b->mode == NETDEV_BOND_MODE_ACTIVE_BACKUP) {
+            b->mode == NETDEV_BOND_MODE_ACTIVE_BACKUP &&
+            !has_slaves) {
                 r = sd_netlink_message_append_u8(m, IFLA_BOND_FAIL_OVER_MAC, b->fail_over_mac);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_FAIL_OVER_MAC attribute: %m");
+                        return r;
         }
 
         if (b->arp_validate != _NETDEV_BOND_ARP_VALIDATE_INVALID) {
                 r = sd_netlink_message_append_u32(m, IFLA_BOND_ARP_VALIDATE, b->arp_validate);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_ARP_VALIDATE attribute: %m");
+                        return r;
         }
 
         if (b->arp_all_targets != _NETDEV_BOND_ARP_ALL_TARGETS_INVALID) {
                 r = sd_netlink_message_append_u32(m, IFLA_BOND_ARP_ALL_TARGETS, b->arp_all_targets);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_ARP_ALL_TARGETS attribute: %m");
+                        return r;
         }
 
         if (b->primary_reselect != _NETDEV_BOND_PRIMARY_RESELECT_INVALID) {
                 r = sd_netlink_message_append_u8(m, IFLA_BOND_PRIMARY_RESELECT, b->primary_reselect);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_PRIMARY_RESELECT attribute: %m");
+                        return r;
         }
 
         if (b->resend_igmp <= RESEND_IGMP_MAX) {
                 r = sd_netlink_message_append_u32(m, IFLA_BOND_RESEND_IGMP, b->resend_igmp);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_RESEND_IGMP attribute: %m");
+                        return r;
         }
 
         if (b->packets_per_slave <= PACKETS_PER_SLAVE_MAX &&
             b->mode == NETDEV_BOND_MODE_BALANCE_RR) {
                 r = sd_netlink_message_append_u32(m, IFLA_BOND_PACKETS_PER_SLAVE, b->packets_per_slave);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_PACKETS_PER_SLAVE attribute: %m");
+                        return r;
         }
 
         if (b->num_grat_arp <= GRATUITOUS_ARP_MAX) {
                 r = sd_netlink_message_append_u8(m, IFLA_BOND_NUM_PEER_NOTIF, b->num_grat_arp);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_NUM_PEER_NOTIF attribute: %m");
+                        return r;
         }
 
         if (b->min_links != 0) {
                 r = sd_netlink_message_append_u32(m, IFLA_BOND_MIN_LINKS, b->min_links);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_MIN_LINKS attribute: %m");
+                        return r;
         }
 
         if (b->ad_actor_sys_prio != 0) {
                 r = sd_netlink_message_append_u16(m, IFLA_BOND_AD_ACTOR_SYS_PRIO, b->ad_actor_sys_prio);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_AD_ACTOR_SYS_PRIO attribute: %m");
+                        return r;
         }
 
-        if (b->ad_user_port_key != 0) {
+        if (b->ad_user_port_key != 0 && !up) {
                 r = sd_netlink_message_append_u16(m, IFLA_BOND_AD_USER_PORT_KEY, b->ad_user_port_key);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_AD_USER_PORT_KEY attribute: %m");
+                        return r;
         }
 
         if (!ether_addr_is_null(&b->ad_actor_system)) {
                 r = sd_netlink_message_append_ether_addr(m, IFLA_BOND_AD_ACTOR_SYSTEM, &b->ad_actor_system);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_AD_ACTOR_SYSTEM attribute: %m");
+                        return r;
         }
 
         r = sd_netlink_message_append_u8(m, IFLA_BOND_ALL_SLAVES_ACTIVE, b->all_slaves_active);
         if (r < 0)
-                return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_ALL_SLAVES_ACTIVE attribute: %m");
+                return r;
 
-        if (b->tlb_dynamic_lb >= 0) {
+        if (b->tlb_dynamic_lb >= 0 && !up) {
                 r = sd_netlink_message_append_u8(m, IFLA_BOND_TLB_DYNAMIC_LB, b->tlb_dynamic_lb);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_TLB_DYNAMIC_LB attribute: %m");
+                        return r;
+        }
+
+        if (b->arp_missed_max > 0) {
+                r = sd_netlink_message_append_u8(m, IFLA_BOND_MISSED_MAX, b->arp_missed_max);
+                if (r < 0)
+                        return r;
         }
 
         if (b->arp_interval > 0 && !ordered_set_isempty(b->arp_ip_targets)) {
@@ -206,92 +232,20 @@ static int netdev_bond_fill_message_create(NetDev *netdev, Link *link, sd_netlin
 
                 r = sd_netlink_message_open_container(m, IFLA_BOND_ARP_IP_TARGET);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not open contaniner IFLA_BOND_ARP_IP_TARGET : %m");
+                        return r;
 
                 ORDERED_SET_FOREACH(val, b->arp_ip_targets) {
                         r = sd_netlink_message_append_u32(m, n++, PTR_TO_UINT32(val));
                         if (r < 0)
-                                return log_netdev_error_errno(netdev, r, "Could not append IFLA_BOND_ARP_ALL_TARGETS attribute: %m");
+                                return r;
                 }
 
                 r = sd_netlink_message_close_container(m);
                 if (r < 0)
-                        return log_netdev_error_errno(netdev, r, "Could not close contaniner IFLA_BOND_ARP_IP_TARGET : %m");
+                        return r;
         }
 
         return 0;
-}
-
-static int link_set_bond_handler(sd_netlink *rtnl, sd_netlink_message *m, Link *link) {
-        int r;
-
-        assert(m);
-        assert(link);
-        assert(link->ifname);
-
-        if (IN_SET(link->state, LINK_STATE_FAILED, LINK_STATE_LINGER))
-                return 1;
-
-        r = sd_netlink_message_get_errno(m);
-        if (r < 0) {
-                log_link_warning_errno(link, r, "Could not set bonding interface: %m");
-                return 1;
-        }
-
-        return 1;
-}
-
-int link_set_bond(Link *link) {
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *req = NULL;
-        int r;
-
-        assert(link);
-        assert(link->network);
-
-        r = sd_rtnl_message_new_link(link->manager->rtnl, &req, RTM_NEWLINK, link->network->bond->ifindex);
-        if (r < 0)
-                return log_link_error_errno(link, r, "Could not allocate RTM_SETLINK message: %m");
-
-        r = sd_netlink_message_set_flags(req, NLM_F_REQUEST | NLM_F_ACK);
-        if (r < 0)
-                return log_link_error_errno(link, r, "Could not set netlink flags: %m");
-
-        r = sd_netlink_message_open_container(req, IFLA_LINKINFO);
-        if (r < 0)
-                return log_link_error_errno(link, r, "Could not append IFLA_PROTINFO attribute: %m");
-
-        r = sd_netlink_message_open_container_union(req, IFLA_INFO_DATA, "bond");
-        if (r < 0)
-                return log_link_error_errno(link, r, "Could not append IFLA_INFO_DATA attribute: %m");
-
-        if (link->network->active_slave) {
-                r = sd_netlink_message_append_u32(req, IFLA_BOND_ACTIVE_SLAVE, link->ifindex);
-                if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append IFLA_BOND_ACTIVE_SLAVE attribute: %m");
-        }
-
-        if (link->network->primary_slave) {
-                r = sd_netlink_message_append_u32(req, IFLA_BOND_PRIMARY, link->ifindex);
-                if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append IFLA_BOND_PRIMARY attribute: %m");
-        }
-
-        r = sd_netlink_message_close_container(req);
-        if (r < 0)
-                return log_link_error_errno(link, r, "Could not append IFLA_LINKINFO attribute: %m");
-
-        r = sd_netlink_message_close_container(req);
-        if (r < 0)
-                return log_link_error_errno(link, r, "Could not append IFLA_INFO_DATA attribute: %m");
-
-        r = netlink_call_async(link->manager->rtnl, NULL, req, link_set_bond_handler,
-                               link_netlink_destroy_callback, link);
-        if (r < 0)
-                return log_link_error_errno(link, r, "Could not send rtnetlink message: %m");
-
-        link_ref(link);
-
-        return r;
 }
 
 int config_parse_arp_ip_target_address(
@@ -306,13 +260,13 @@ int config_parse_arp_ip_target_address(
                 void *data,
                 void *userdata) {
 
-        Bond *b = userdata;
-        int r;
-
         assert(filename);
         assert(lvalue);
         assert(rvalue);
         assert(data);
+
+        Bond *b = BOND(userdata);
+        int r;
 
         if (isempty(rvalue)) {
                 b->arp_ip_targets = ordered_set_free(b->arp_ip_targets);
@@ -342,10 +296,6 @@ int config_parse_arp_ip_target_address(
                         continue;
                 }
 
-                r = ordered_set_ensure_allocated(&b->arp_ip_targets, NULL);
-                if (r < 0)
-                        return log_oom();
-
                 if (ordered_set_size(b->arp_ip_targets) >= NETDEV_BOND_ARP_TARGETS_MAX) {
                         log_syntax(unit, LOG_WARNING, filename, line, 0,
                                    "Too many ARP IP targets are specified. The maximum number is %d. Ignoring assignment: %s",
@@ -353,7 +303,9 @@ int config_parse_arp_ip_target_address(
                         continue;
                 }
 
-                r = ordered_set_put(b->arp_ip_targets, UINT32_TO_PTR(ip.in.s_addr));
+                r = ordered_set_ensure_put(&b->arp_ip_targets, NULL, UINT32_TO_PTR(ip.in.s_addr));
+                if (r == -ENOMEM)
+                        return log_oom();
                 if (r == -EEXIST)
                         log_syntax(unit, LOG_WARNING, filename, line, r,
                                    "Bond ARP IP target address is duplicated, ignoring assignment: %s", n);
@@ -374,32 +326,18 @@ int config_parse_ad_actor_sys_prio(
                 const char *rvalue,
                 void *data,
                 void *userdata) {
-        Bond *b = userdata;
-        uint16_t v;
-        int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
         assert(data);
 
-        r = safe_atou16(rvalue, &v);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse actor system priority '%s', ignoring: %m", rvalue);
-                return 0;
-        }
+        Bond *b = ASSERT_PTR(userdata);
 
-        if (v == 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Failed to parse actor system priority '%s'. Range is [1,65535], ignoring.",
-                           rvalue);
-                return 0;
-        }
-
-        b->ad_actor_sys_prio = v;
-
-        return 0;
+        return config_parse_uint16_bounded(
+                        unit, filename, line, section, section_line, lvalue, rvalue,
+                        1, UINT16_MAX, true,
+                        &b->ad_actor_sys_prio);
 }
 
 int config_parse_ad_user_port_key(
@@ -413,31 +351,18 @@ int config_parse_ad_user_port_key(
                 const char *rvalue,
                 void *data,
                 void *userdata) {
-        Bond *b = userdata;
-        uint16_t v;
-        int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
         assert(data);
 
-        r = safe_atou16(rvalue, &v);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse user port key '%s', ignoring: %m", rvalue);
-                return 0;
-        }
+        Bond *b = ASSERT_PTR(userdata);
 
-        if (v > 1023) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Failed to parse user port key '%s'. Range is [0…1023], ignoring.", rvalue);
-                return 0;
-        }
-
-        b->ad_user_port_key = v;
-
-        return 0;
+        return config_parse_uint16_bounded(
+                        unit, filename, line, section, section_line, lvalue, rvalue,
+                        0, 1023, /* ignoring= */ true,
+                        &b->ad_user_port_key);
 }
 
 int config_parse_ad_actor_system(
@@ -460,7 +385,7 @@ int config_parse_ad_actor_system(
         assert(rvalue);
         assert(data);
 
-        r = ether_addr_from_string(rvalue, &n);
+        r = parse_ether_addr(rvalue, &n);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Not a valid MAC address %s. Ignoring assignment: %m",
@@ -480,23 +405,13 @@ int config_parse_ad_actor_system(
 }
 
 static void bond_done(NetDev *netdev) {
-        Bond *b;
-
-        assert(netdev);
-        b = BOND(netdev);
-        assert(b);
+        Bond *b = BOND(netdev);
 
         ordered_set_free(b->arp_ip_targets);
 }
 
 static void bond_init(NetDev *netdev) {
-        Bond *b;
-
-        assert(netdev);
-
-        b = BOND(netdev);
-
-        assert(b);
+        Bond *b = BOND(netdev);
 
         b->mode = _NETDEV_BOND_MODE_INVALID;
         b->xmit_hash_policy = _NETDEV_BOND_XMIT_HASH_POLICY_INVALID;
@@ -522,6 +437,7 @@ const NetDevVTable bond_vtable = {
         .done = bond_done,
         .sections = NETDEV_COMMON_SECTIONS "Bond\0",
         .fill_message_create = netdev_bond_fill_message_create,
-        .create_type = NETDEV_CREATE_MASTER,
+        .create_type = NETDEV_CREATE_INDEPENDENT,
+        .iftype = ARPHRD_ETHER,
         .generate_mac = true,
 };

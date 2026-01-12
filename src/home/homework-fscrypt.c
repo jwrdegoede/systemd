@@ -1,20 +1,29 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <linux/fs.h>
+#include <linux/fscrypt.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <sys/ioctl.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
 #include <sys/xattr.h>
+#include <unistd.h>
 
+#include "alloc-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
+#include "format-util.h"
 #include "hexdecoct.h"
 #include "homework-fscrypt.h"
+#include "homework-mount.h"
+#include "homework-password-cache.h"
 #include "homework-quota.h"
+#include "homework.h"
+#include "keyring-util.h"
+#include "log.h"
 #include "memory-util.h"
-#include "missing_keyctl.h"
-#include "missing_syscall.h"
 #include "mkdir.h"
+#include "mount-util.h"
 #include "nulstr-util.h"
 #include "openssl-util.h"
 #include "parse-util.h"
@@ -22,10 +31,104 @@
 #include "random-util.h"
 #include "rm-rf.h"
 #include "stdio-util.h"
+#include "string-util.h"
 #include "strv.h"
 #include "tmpfile-util.h"
+#include "user-record-util.h"
+#include "user-record.h"
 #include "user-util.h"
 #include "xattr-util.h"
+
+static int fscrypt_unlink_key(UserRecord *h) {
+        _cleanup_free_ void *keyring = NULL;
+        size_t keyring_size = 0, n_keys = 0;
+        int r;
+
+        assert(h);
+        assert(user_record_storage(h) == USER_FSCRYPT);
+
+        r = fully_set_uid_gid(
+                        h->uid,
+                        user_record_gid(h),
+                        /* supplementary_gids= */ NULL,
+                        /* n_supplementary_gids= */ 0);
+        if (r < 0)
+                return log_error_errno(r, "Failed to change UID/GID to " UID_FMT "/" GID_FMT ": %m",
+                                       h->uid, user_record_gid(h));
+
+        r = keyring_read(KEY_SPEC_USER_KEYRING, &keyring, &keyring_size);
+        if (r < 0)
+                return log_error_errno(r, "Failed to read the keyring of user " UID_FMT ": %m", h->uid);
+
+        n_keys = keyring_size / sizeof(key_serial_t);
+        assert(keyring_size % sizeof(key_serial_t) == 0);
+
+        /* Find any key with a description starting with 'fscrypt:' and unlink it. We need to iterate as we
+         * store the key with a description that uses the hash of the secret key, that we do not have when
+         * we are deactivating. */
+        FOREACH_ARRAY(key, ((key_serial_t *) keyring), n_keys) {
+                _cleanup_free_ char *description = NULL;
+                char *d;
+
+                r = keyring_describe(*key, &description);
+                if (r == -ENOKEY) /* Something else deleted it already, that's ok. */
+                        continue;
+                if (r < 0)
+                        return log_error_errno(r, "Failed to describe key id %d: %m", *key);
+
+                /* The description is the final element as per manpage. */
+                d = strrchr(description, ';');
+                if (!d)
+                        return log_error_errno(
+                                        SYNTHETIC_ERRNO(EINVAL),
+                                        "Failed to parse description of key id %d: %s",
+                                        *key,
+                                        description);
+
+                if (!startswith(d + 1, "fscrypt:"))
+                        continue;
+
+                r = keyctl(KEYCTL_UNLINK, *key, KEY_SPEC_USER_KEYRING, 0, 0);
+                if (r < 0) {
+                        if (errno == ENOKEY) /* Something else deleted it already, that's ok. */
+                                continue;
+
+                        return log_error_errno(
+                                        errno,
+                                        "Failed to delete encryption key with id '%d' from the keyring of user " UID_FMT ": %m",
+                                        *key,
+                                        h->uid);
+                }
+
+                log_debug("Deleted encryption key with id '%d' from the keyring of user " UID_FMT ".", *key, h->uid);
+        }
+
+        return 0;
+}
+
+int home_flush_keyring_fscrypt(UserRecord *h) {
+        int r;
+
+        assert(h);
+        assert(user_record_storage(h) == USER_FSCRYPT);
+
+        if (!uid_is_valid(h->uid))
+                return 0;
+
+        r = pidref_safe_fork(
+                        "(sd-delkey)",
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT|FORK_REOPEN_LOG,
+                        /* ret= */ NULL);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                if (fscrypt_unlink_key(h) < 0)
+                        _exit(EXIT_FAILURE);
+                _exit(EXIT_SUCCESS);
+        }
+
+        return 0;
+}
 
 static int fscrypt_upload_volume_key(
                 const uint8_t key_descriptor[static FS_KEY_DESCRIPTOR_SIZE],
@@ -56,10 +159,10 @@ static int fscrypt_upload_volume_key(
         };
         memcpy(key.raw, volume_key, volume_key_size);
 
+        CLEANUP_ERASE(key);
+
         /* Upload to the kernel */
         serial = add_key("logon", description, &key, sizeof(key), where);
-        explicit_bzero_safe(&key, sizeof(key));
-
         if (serial < 0)
                 return log_error_errno(errno, "Failed to install master key in keyring: %m");
 
@@ -92,7 +195,6 @@ static int fscrypt_slot_try_one(
                 const uint8_t match_key_descriptor[static FS_KEY_DESCRIPTOR_SIZE],
                 void **ret_decrypted, size_t *ret_decrypted_size) {
 
-
         _cleanup_(EVP_CIPHER_CTX_freep) EVP_CIPHER_CTX *context = NULL;
         _cleanup_(erase_and_freep) void *decrypted = NULL;
         uint8_t key_descriptor[FS_KEY_DESCRIPTOR_SIZE];
@@ -122,20 +224,18 @@ static int fscrypt_slot_try_one(
          *      resulting hash.
          */
 
+        CLEANUP_ERASE(derived);
+
         if (PKCS5_PBKDF2_HMAC(
                             password, strlen(password),
                             salt, salt_size,
                             0xFFFF, EVP_sha512(),
-                            sizeof(derived), derived) != 1) {
-                r = log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "PBKDF2 failed");
-                goto finish;
-        }
+                            sizeof(derived), derived) != 1)
+                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "PBKDF2 failed.");
 
         context = EVP_CIPHER_CTX_new();
-        if (!context) {
-                r = log_oom();
-                goto finish;
-        }
+        if (!context)
+                return log_oom();
 
         /* We use AES256 in counter mode */
         assert_se(cc = EVP_aes_256_ctr());
@@ -143,13 +243,8 @@ static int fscrypt_slot_try_one(
         /* We only use the first half of the derived key */
         assert(sizeof(derived) >= (size_t) EVP_CIPHER_key_length(cc));
 
-        if (EVP_DecryptInit_ex(context, cc, NULL, derived, NULL) != 1)  {
-                r = log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to initialize decryption context.");
-                goto finish;
-        }
-
-        /* Flush out the derived key now, we don't need it anymore */
-        explicit_bzero_safe(derived, sizeof(derived));
+        if (EVP_DecryptInit_ex(context, cc, NULL, derived, NULL) != 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to initialize decryption context.");
 
         decrypted_size = encrypted_size + EVP_CIPHER_key_length(cc) * 2;
         decrypted = malloc(decrypted_size);
@@ -182,10 +277,6 @@ static int fscrypt_slot_try_one(
                 *ret_decrypted_size = decrypted_size;
 
         return 0;
-
-finish:
-        explicit_bzero_safe(derived, sizeof(derived));
-        return r;
 }
 
 static int fscrypt_slot_try_many(
@@ -195,7 +286,6 @@ static int fscrypt_slot_try_many(
                 const uint8_t match_key_descriptor[static FS_KEY_DESCRIPTOR_SIZE],
                 void **ret_decrypted, size_t *ret_decrypted_size) {
 
-        char **i;
         int r;
 
         STRV_FOREACH(i, passwords) {
@@ -215,7 +305,6 @@ static int fscrypt_setup(
                 size_t *ret_volume_key_size) {
 
         _cleanup_free_ char *xattr_buf = NULL;
-        const char *xa;
         int r;
 
         assert(setup);
@@ -223,66 +312,62 @@ static int fscrypt_setup(
 
         r = flistxattr_malloc(setup->root_fd, &xattr_buf);
         if (r < 0)
-                return log_error_errno(errno, "Failed to retrieve xattr list: %m");
+                return log_error_errno(r, "Failed to retrieve xattr list: %m");
 
         NULSTR_FOREACH(xa, xattr_buf) {
                 _cleanup_free_ void *salt = NULL, *encrypted = NULL;
                 _cleanup_free_ char *value = NULL;
-                size_t salt_size, encrypted_size;
+                size_t salt_size, encrypted_size, vsize;
                 const char *nr, *e;
-                char **list;
-                int n;
 
-                /* Check if this xattr has the format 'trusted.fscrypt_slot<nr>' where '<nr>' is a 32bit unsigned integer */
+                /* Check if this xattr has the format 'trusted.fscrypt_slot<nr>' where '<nr>' is a 32-bit unsigned integer */
                 nr = startswith(xa, "trusted.fscrypt_slot");
                 if (!nr)
                         continue;
                 if (safe_atou32(nr, NULL) < 0)
                         continue;
 
-                n = fgetxattr_malloc(setup->root_fd, xa, &value);
-                if (n == -ENODATA) /* deleted by now? */
+                r = fgetxattr_malloc(setup->root_fd, xa, &value, &vsize);
+                if (r == -ENODATA) /* deleted by now? */
                         continue;
-                if (n < 0)
-                        return log_error_errno(n, "Failed to read %s xattr: %m", xa);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read %s xattr: %m", xa);
 
-                e = memchr(value, ':', n);
+                e = memchr(value, ':', vsize);
                 if (!e)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "xattr %s lacks ':' separator: %m", xa);
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "xattr %s lacks ':' separator.", xa);
 
-                r = unbase64mem(value, e - value, &salt, &salt_size);
+                r = unbase64mem_full(value, e - value, /* secure= */ false, &salt, &salt_size);
                 if (r < 0)
                         return log_error_errno(r, "Failed to decode salt of %s: %m", xa);
-                r = unbase64mem(e+1, n - (e - value) - 1, &encrypted, &encrypted_size);
+
+                r = unbase64mem_full(e + 1, vsize - (e - value) - 1, /* secure= */ false, &encrypted, &encrypted_size);
                 if (r < 0)
                         return log_error_errno(r, "Failed to decode encrypted key of %s: %m", xa);
 
                 r = -ENOANO;
-                FOREACH_POINTER(list, cache->pkcs11_passwords, cache->fido2_passwords, password) {
+                char **list;
+                FOREACH_ARGUMENT(list, cache->pkcs11_passwords, cache->fido2_passwords, password) {
                         r = fscrypt_slot_try_many(
                                         list,
                                         salt, salt_size,
                                         encrypted, encrypted_size,
                                         setup->fscrypt_key_descriptor,
                                         ret_volume_key, ret_volume_key_size);
-                        if (r != -ENOANO)
-                                break;
-                }
-                if (r < 0) {
+                        if (r >= 0)
+                                return 0;
                         if (r != -ENOANO)
                                 return r;
-                } else
-                        return 0;
+                }
         }
 
         return log_error_errno(SYNTHETIC_ERRNO(ENOKEY), "Failed to set up home directory with provided passwords.");
 }
 
-int home_prepare_fscrypt(
+int home_setup_fscrypt(
                 UserRecord *h,
-                bool already_activated,
-                PasswordCache *cache,
-                HomeSetup *setup) {
+                HomeSetup *setup,
+                const PasswordCache *cache) {
 
         _cleanup_(erase_and_freep) void *volume_key = NULL;
         struct fscrypt_policy policy = {};
@@ -291,8 +376,9 @@ int home_prepare_fscrypt(
         int r;
 
         assert(h);
-        assert(setup);
         assert(user_record_storage(h) == USER_FSCRYPT);
+        assert(setup);
+        assert(setup->root_fd < 0);
 
         assert_se(ip = user_record_image_path(h));
 
@@ -324,27 +410,18 @@ int home_prepare_fscrypt(
         /* Also install the access key in the user's own keyring */
 
         if (uid_is_valid(h->uid)) {
-                r = safe_fork("(sd-addkey)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_LOG|FORK_WAIT, NULL);
+                r = pidref_safe_fork(
+                                "(sd-addkey)",
+                                FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT|FORK_REOPEN_LOG,
+                                /* ret= */ NULL);
                 if (r < 0)
-                        return log_error_errno(r, "Failed install encryption key in user's keyring: %m");
+                        return log_error_errno(r, "Failed to install encryption key in user's keyring: %m");
                 if (r == 0) {
-                        gid_t gid;
-
                         /* Child */
 
-                        gid = user_record_gid(h);
-                        if (setresgid(gid, gid, gid) < 0) {
-                                log_error_errno(errno, "Failed to change GID to " GID_FMT ": %m", gid);
-                                _exit(EXIT_FAILURE);
-                        }
-
-                        if (setgroups(0, NULL) < 0) {
-                                log_error_errno(errno, "Failed to reset auxiliary groups list: %m");
-                                _exit(EXIT_FAILURE);
-                        }
-
-                        if (setresuid(h->uid, h->uid, h->uid) < 0) {
-                                log_error_errno(errno, "Failed to change UID to " UID_FMT ": %m", h->uid);
+                        r = fully_set_uid_gid(h->uid, user_record_gid(h), /* supplementary_gids= */ NULL, /* n_supplementary_gids= */ 0);
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to change UID/GID to " UID_FMT "/" GID_FMT ": %m", h->uid, user_record_gid(h));
                                 _exit(EXIT_FAILURE);
                         }
 
@@ -359,6 +436,33 @@ int home_prepare_fscrypt(
                         _exit(EXIT_SUCCESS);
                 }
         }
+
+        /* We'll bind mount the image directory to a new mount point where we'll start adjusting it. Only
+         * once that's complete we'll move the thing to its final place eventually. */
+        r = home_unshare_and_mkdir();
+        if (r < 0)
+                return r;
+
+        r = mount_follow_verbose(LOG_ERR, ip, HOME_RUNTIME_WORK_DIR, NULL, MS_BIND, NULL);
+        if (r < 0)
+                return r;
+
+        setup->undo_mount = true;
+
+        /* Turn off any form of propagation for this */
+        r = mount_nofollow_verbose(LOG_ERR, NULL, HOME_RUNTIME_WORK_DIR, NULL, MS_PRIVATE, NULL);
+        if (r < 0)
+                return r;
+
+        /* Adjust MS_SUID and similar flags */
+        r = mount_nofollow_verbose(LOG_ERR, NULL, HOME_RUNTIME_WORK_DIR, NULL, MS_BIND|MS_REMOUNT|user_record_mount_flags(h), NULL);
+        if (r < 0)
+                return r;
+
+        safe_close(setup->root_fd);
+        setup->root_fd = open(HOME_RUNTIME_WORK_DIR, O_RDONLY|O_CLOEXEC|O_DIRECTORY|O_NOFOLLOW);
+        if (setup->root_fd < 0)
+                return log_error_errno(errno, "Failed to open home directory: %m");
 
         return 0;
 }
@@ -378,25 +482,24 @@ static int fscrypt_slot_set(
         _cleanup_free_ void *encrypted = NULL;
         const EVP_CIPHER *cc;
         size_t encrypted_size;
+        ssize_t ss;
 
-        r = genuine_random_bytes(salt, sizeof(salt), RANDOM_BLOCK);
+        r = crypto_random_bytes(salt, sizeof(salt));
         if (r < 0)
                 return log_error_errno(r, "Failed to generate salt: %m");
+
+        CLEANUP_ERASE(derived);
 
         if (PKCS5_PBKDF2_HMAC(
                             password, strlen(password),
                             salt, sizeof(salt),
                             0xFFFF, EVP_sha512(),
-                            sizeof(derived), derived) != 1) {
-                r = log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "PBKDF2 failed");
-                goto finish;
-        }
+                            sizeof(derived), derived) != 1)
+                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "PBKDF2 failed");
 
         context = EVP_CIPHER_CTX_new();
-        if (!context) {
-                r = log_oom();
-                goto finish;
-        }
+        if (!context)
+                return log_oom();
 
         /* We use AES256 in counter mode */
         cc = EVP_aes_256_ctr();
@@ -404,13 +507,8 @@ static int fscrypt_slot_set(
         /* We only use the first half of the derived key */
         assert(sizeof(derived) >= (size_t) EVP_CIPHER_key_length(cc));
 
-        if (EVP_EncryptInit_ex(context, cc, NULL, derived, NULL) != 1)  {
-                r = log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to initialize encryption context.");
-                goto finish;
-        }
-
-        /* Flush out the derived key now, we don't need it anymore */
-        explicit_bzero_safe(derived, sizeof(derived));
+        if (EVP_EncryptInit_ex(context, cc, NULL, derived, NULL) != 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to initialize encryption context.");
 
         encrypted_size = volume_key_size + EVP_CIPHER_key_length(cc) * 2;
         encrypted = malloc(encrypted_size);
@@ -428,12 +526,12 @@ static int fscrypt_slot_set(
         assert((size_t) encrypted_size_out1 + (size_t) encrypted_size_out2 < encrypted_size);
         encrypted_size = (size_t) encrypted_size_out1 + (size_t) encrypted_size_out2;
 
-        r = base64mem(salt, sizeof(salt), &salt_base64);
-        if (r < 0)
+        ss = base64mem(salt, sizeof(salt), &salt_base64);
+        if (ss < 0)
                 return log_oom();
 
-        r = base64mem(encrypted, encrypted_size, &encrypted_base64);
-        if (r < 0)
+        ss = base64mem(encrypted, encrypted_size, &encrypted_base64);
+        if (ss < 0)
                 return log_oom();
 
         joined = strjoin(salt_base64, ":", encrypted_base64);
@@ -447,31 +545,28 @@ static int fscrypt_slot_set(
         log_info("Written key slot %s.", label);
 
         return 0;
-
-finish:
-        explicit_bzero_safe(derived, sizeof(derived));
-        return r;
 }
 
 int home_create_fscrypt(
                 UserRecord *h,
+                HomeSetup *setup,
                 char **effective_passwords,
                 UserRecord **ret_home) {
 
         _cleanup_(rm_rf_physical_and_freep) char *temporary = NULL;
         _cleanup_(user_record_unrefp) UserRecord *new_home = NULL;
         _cleanup_(erase_and_freep) void *volume_key = NULL;
+        _cleanup_close_ int mount_fd = -EBADF;
         struct fscrypt_policy policy = {};
         size_t volume_key_size = 512 / 8;
-        _cleanup_close_ int root_fd = -1;
         _cleanup_free_ char *d = NULL;
         uint32_t nr = 0;
         const char *ip;
-        char **i;
         int r;
 
         assert(h);
         assert(user_record_storage(h) == USER_FSCRYPT);
+        assert(setup);
         assert(ret_home);
 
         assert_se(ip = user_record_image_path(h));
@@ -487,11 +582,15 @@ int home_create_fscrypt(
 
         temporary = TAKE_PTR(d); /* Needs to be destroyed now */
 
-        root_fd = open(temporary, O_RDONLY|O_CLOEXEC|O_DIRECTORY|O_NOFOLLOW);
-        if (root_fd < 0)
+        r = home_unshare_and_mkdir();
+        if (r < 0)
+                return r;
+
+        setup->root_fd = open(temporary, O_RDONLY|O_CLOEXEC|O_DIRECTORY|O_NOFOLLOW);
+        if (setup->root_fd < 0)
                 return log_error_errno(errno, "Failed to open temporary home directory: %m");
 
-        if (ioctl(root_fd, FS_IOC_GET_ENCRYPTION_POLICY, &policy) < 0) {
+        if (ioctl(setup->root_fd, FS_IOC_GET_ENCRYPTION_POLICY, &policy) < 0) {
                 if (ERRNO_IS_NOT_SUPPORTED(errno)) {
                         log_error_errno(errno, "File system does not support fscrypt: %m");
                         return -ENOLINK; /* make recognizable */
@@ -505,7 +604,7 @@ int home_create_fscrypt(
         if (!volume_key)
                 return log_oom();
 
-        r = genuine_random_bytes(volume_key, volume_key_size, RANDOM_BLOCK);
+        r = crypto_random_bytes(volume_key, volume_key_size);
         if (r < 0)
                 return log_error_errno(r, "Failed to acquire volume key: %m");
 
@@ -525,30 +624,45 @@ int home_create_fscrypt(
 
         log_info("Uploaded volume key to kernel.");
 
-        if (ioctl(root_fd, FS_IOC_SET_ENCRYPTION_POLICY, &policy) < 0)
+        if (ioctl(setup->root_fd, FS_IOC_SET_ENCRYPTION_POLICY, &policy) < 0)
                 return log_error_errno(errno, "Failed to set fscrypt policy on directory: %m");
 
         log_info("Encryption policy set.");
 
         STRV_FOREACH(i, effective_passwords) {
-                r = fscrypt_slot_set(root_fd, volume_key, volume_key_size, *i, nr);
+                r = fscrypt_slot_set(setup->root_fd, volume_key, volume_key_size, *i, nr);
                 if (r < 0)
                         return r;
 
                 nr++;
         }
 
-        (void) home_update_quota_classic(h, temporary);
+        (void) home_update_quota_classic(h, setup->root_fd, temporary);
 
-        r = home_populate(h, root_fd);
+        r = home_shift_uid(setup->root_fd, HOME_RUNTIME_WORK_DIR, h->uid, h->uid, &mount_fd);
+        if (r > 0)
+                setup->undo_mount = true; /* If uidmaps worked we have a mount to undo again */
+
+        if (mount_fd >= 0) {
+                /* If we have established a new mount, then we can use that as new root fd to our home directory. */
+                safe_close(setup->root_fd);
+
+                setup->root_fd = fd_reopen(mount_fd, O_RDONLY|O_CLOEXEC|O_DIRECTORY);
+                if (setup->root_fd < 0)
+                        return log_error_errno(setup->root_fd, "Unable to convert mount fd into proper directory fd: %m");
+
+                mount_fd = safe_close(mount_fd);
+        }
+
+        r = home_populate(h, setup->root_fd);
         if (r < 0)
                 return r;
 
-        r = home_sync_and_statfs(root_fd, NULL);
+        r = home_sync_and_statfs(setup->root_fd, NULL);
         if (r < 0)
                 return r;
 
-        r = user_record_clone(h, USER_RECORD_LOAD_MASK_SECRET, &new_home);
+        r = user_record_clone(h, USER_RECORD_LOAD_MASK_SECRET|USER_RECORD_PERMISSIVE, &new_home);
         if (r < 0)
                 return log_error_errno(r, "Failed to clone record: %m");
 
@@ -569,6 +683,12 @@ int home_create_fscrypt(
         if (r < 0)
                 return log_error_errno(r, "Failed to add binding to record: %m");
 
+        setup->root_fd = safe_close(setup->root_fd);
+
+        r = home_setup_undo_mount(setup, LOG_ERR);
+        if (r < 0)
+                return r;
+
         if (rename(temporary, ip) < 0)
                 return log_error_errno(errno, "Failed to rename %s to %s: %m", temporary, ip);
 
@@ -583,15 +703,13 @@ int home_create_fscrypt(
 int home_passwd_fscrypt(
                 UserRecord *h,
                 HomeSetup *setup,
-                PasswordCache *cache,               /* the passwords acquired via PKCS#11/FIDO2 security tokens */
+                const PasswordCache *cache,         /* the passwords acquired via PKCS#11/FIDO2 security tokens */
                 char **effective_passwords          /* new passwords */) {
 
         _cleanup_(erase_and_freep) void *volume_key = NULL;
         _cleanup_free_ char *xattr_buf = NULL;
         size_t volume_key_size = 0;
         uint32_t slot = 0;
-        const char *xa;
-        char **p;
         int r;
 
         assert(h);
@@ -617,13 +735,13 @@ int home_passwd_fscrypt(
 
         r = flistxattr_malloc(setup->root_fd, &xattr_buf);
         if (r < 0)
-                return log_error_errno(errno, "Failed to retrieve xattr list: %m");
+                return log_error_errno(r, "Failed to retrieve xattr list: %m");
 
         NULSTR_FOREACH(xa, xattr_buf) {
                 const char *nr;
                 uint32_t z;
 
-                /* Check if this xattr has the format 'trusted.fscrypt_slot<nr>' where '<nr>' is a 32bit unsigned integer */
+                /* Check if this xattr has the format 'trusted.fscrypt_slot<nr>' where '<nr>' is a 32-bit unsigned integer */
                 nr = startswith(xa, "trusted.fscrypt_slot");
                 if (!nr)
                         continue;
@@ -634,7 +752,6 @@ int home_passwd_fscrypt(
                         continue;
 
                 if (fremovexattr(setup->root_fd, xa) < 0)
-
                         if (errno != ENODATA)
                                 log_warning_errno(errno, "Failed to remove xattr %s: %m", xa);
         }

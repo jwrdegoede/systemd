@@ -1,28 +1,61 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-systemd_coredump_sources = files('''
-        coredump.c
-        coredump-vacuum.c
-        coredump-vacuum.h
-'''.split())
-
-if conf.get('HAVE_ELFUTILS') == 1
-        systemd_coredump_sources += files(['stacktrace.c',
-                                           'stacktrace.h'])
+if conf.get('ENABLE_COREDUMP') != 1
+        subdir_done()
 endif
 
-coredumpctl_sources = files('coredumpctl.c')
+systemd_coredump_sources = files(
+        'coredump.c',
+        'coredump-backtrace.c',
+        'coredump-config.c',
+        'coredump-context.c',
+        'coredump-kernel-helper.c',
+        'coredump-receive.c',
+        'coredump-send.c',
+        'coredump-submit.c',
+)
+systemd_coredump_extract_sources = files(
+        'coredump-vacuum.c',
+)
 
-if conf.get('ENABLE_COREDUMP') == 1 and install_sysconfdir
-        install_data('coredump.conf',
-                     install_dir : pkgsysconfdir)
-endif
+coredump_gperf_c = custom_target(
+        input : 'coredump-gperf.gperf',
+        output : 'coredump-gperf.c',
+        command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
 
-tests += [
-        [['src/coredump/test-coredump-vacuum.c',
-          'src/coredump/coredump-vacuum.c',
-          'src/coredump/coredump-vacuum.h'],
-         [],
-         [],
-         'ENABLE_COREDUMP', 'manual'],
+generated_sources += coredump_gperf_c
+systemd_coredump_sources += coredump_gperf_c
+
+common_dependencies = [
+        liblz4_cflags,
+        libxz_cflags,
+        libzstd_cflags,
+        threads,
 ]
+
+executables += [
+        libexec_template + {
+                'name' : 'systemd-coredump',
+                'sources' : systemd_coredump_sources,
+                'extract' : systemd_coredump_extract_sources,
+                'link_with' : [libshared],
+                'dependencies' : common_dependencies,
+        },
+        executable_template + {
+                'name' : 'coredumpctl',
+                'public' : true,
+                'sources' : files('coredumpctl.c'),
+                'link_with' : [libshared],
+                'dependencies' : common_dependencies,
+        },
+        test_template + {
+                'sources' : files('test-coredump-vacuum.c'),
+                'objects' : ['systemd-coredump'],
+                'type' : 'manual',
+        },
+]
+
+if install_sysconfdir_samples
+        install_data('coredump.conf',
+                     install_dir : pkgconfigfiledir)
+endif

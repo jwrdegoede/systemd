@@ -1,19 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stddef.h>
-#include <sys/un.h>
-
-#include "alloc-util.h"
-#include "main-func.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "log.h"
-#include "macro.h"
-#include "memory-util.h"
+#include "main-func.h"
 #include "socket-util.h"
 #include "string-util.h"
-#include "util.h"
 
 static int send_on_socket(int fd, const char *socket_name, const void *packet, size_t size) {
         union sockaddr_union sa = {};
@@ -35,11 +27,11 @@ static int send_on_socket(int fd, const char *socket_name, const void *packet, s
 
 static int run(int argc, char *argv[]) {
         _cleanup_(erase_and_freep) char *packet = NULL;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         size_t length = 0;
         int r;
 
-        log_setup_service();
+        log_setup();
 
         if (argc != 3)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Wrong number of arguments.");

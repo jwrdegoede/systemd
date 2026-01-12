@@ -1,17 +1,18 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdlib.h>
+#include "sd-id128.h"
 
 #include "alloc-util.h"
 #include "glob-util.h"
 #include "hexdecoct.h"
+#include "log.h"
+#include "memory-util.h"
 #include "path-util.h"
+#include "sparse-endian.h"
 #include "special.h"
+#include "siphash24.h"
 #include "string-util.h"
-#include "strv.h"
+#include "unit-def.h"
 #include "unit-name.h"
 
 /* Characters valid in a unit name. */
@@ -29,6 +30,9 @@
 #define VALID_CHARS_GLOB                        \
         VALID_CHARS_WITH_AT                     \
         "[]!-*?"
+
+#define LONG_UNIT_NAME_HASH_KEY SD_ID128_MAKE(ec,f2,37,fb,58,32,4a,32,84,9f,06,9b,0d,21,eb,9a)
+#define UNIT_NAME_HASH_LENGTH_CHARS 16
 
 bool unit_name_is_valid(const char *n, UnitNameFlags flags) {
         const char *e, *i, *at;
@@ -56,7 +60,7 @@ bool unit_name_is_valid(const char *n, UnitNameFlags flags) {
                 if (*i == '@' && !at)
                         at = i;
 
-                if (!strchr("@" VALID_CHARS, *i))
+                if (!strchr(VALID_CHARS_WITH_AT, *i))
                         return false;
         }
 
@@ -139,7 +143,7 @@ int unit_name_to_prefix(const char *n, char **ret) {
         return 0;
 }
 
-int unit_name_to_instance(const char *n, char **ret) {
+UnitNameFlags unit_name_to_instance(const char *n, char **ret) {
         const char *p, *d;
 
         assert(n);
@@ -209,7 +213,7 @@ UnitType unit_name_to_type(const char *n) {
 int unit_name_change_suffix(const char *n, const char *suffix, char **ret) {
         _cleanup_free_ char *s = NULL;
         size_t a, b;
-        char *e;
+        const char *e;
 
         assert(n);
         assert(suffix);
@@ -252,7 +256,7 @@ int unit_name_build(const char *prefix, const char *instance, const char *suffix
 
         type = unit_type_from_string(suffix + 1);
         if (type < 0)
-                return -EINVAL;
+                return type;
 
         return unit_name_build_from_type(prefix, instance, type, ret);
 }
@@ -322,7 +326,7 @@ static char *do_escape(const char *f, char *t) {
         return t;
 }
 
-char *unit_name_escape(const char *f) {
+char* unit_name_escape(const char *f) {
         char *r, *t;
 
         assert(f);
@@ -378,16 +382,16 @@ int unit_name_unescape(const char *f, char **ret) {
 }
 
 int unit_name_path_escape(const char *f, char **ret) {
-        char *p, *s;
+        _cleanup_free_ char *p = NULL;
+        char *s;
+        int r;
 
         assert(f);
         assert(ret);
 
-        p = strdupa(f);
-        if (!p)
-                return -ENOMEM;
-
-        path_simplify(p, false);
+        r = path_simplify_alloc(f, &p);
+        if (r < 0)
+                return r;
 
         if (empty_or_root(p))
                 s = strdup("-");
@@ -395,13 +399,9 @@ int unit_name_path_escape(const char *f, char **ret) {
                 if (!path_is_normalized(p))
                         return -EINVAL;
 
-                /* Truncate trailing slashes */
+                /* Truncate trailing slashes and skip leading slashes */
                 delete_trailing_chars(p, "/");
-
-                /* Truncate leading slashes */
-                p = skip_leading_chars(p, "/");
-
-                s = unit_name_escape(p);
+                s = unit_name_escape(skip_leading_chars(p, "/"));
         }
         if (!s)
                 return -ENOMEM;
@@ -449,34 +449,45 @@ int unit_name_path_unescape(const char *f, char **ret) {
         return 0;
 }
 
-int unit_name_replace_instance(const char *f, const char *i, char **ret) {
-        _cleanup_free_ char *s = NULL;
-        const char *p, *e;
-        size_t a, b;
+int unit_name_replace_instance_full(
+                const char *original,
+                const char *instance,
+                bool accept_glob,
+                char **ret) {
 
-        assert(f);
-        assert(i);
+        _cleanup_free_ char *s = NULL;
+        const char *prefix, *suffix;
+        size_t pl;
+
+        assert(original);
+        assert(instance);
         assert(ret);
 
-        if (!unit_name_is_valid(f, UNIT_NAME_INSTANCE|UNIT_NAME_TEMPLATE))
+        if (!unit_name_is_valid(original, UNIT_NAME_INSTANCE|UNIT_NAME_TEMPLATE))
                 return -EINVAL;
-        if (!unit_instance_is_valid(i))
+        if (!unit_instance_is_valid(instance) && !(accept_glob && in_charset(instance, VALID_CHARS_GLOB)))
                 return -EINVAL;
 
-        assert_se(p = strchr(f, '@'));
-        assert_se(e = strrchr(f, '.'));
+        prefix = ASSERT_PTR(strchr(original, '@'));
+        suffix = ASSERT_PTR(strrchr(original, '.'));
+        assert(prefix < suffix);
 
-        a = p - f;
-        b = strlen(i);
+        pl = prefix - original + 1; /* include '@' */
 
-        s = new(char, a + 1 + b + strlen(e) + 1);
+        s = new(char, pl + strlen(instance) + strlen(suffix) + 1);
         if (!s)
                 return -ENOMEM;
 
-        strcpy(mempcpy(mempcpy(s, f, a + 1), i, b), e);
+#if HAS_FEATURE_MEMORY_SANITIZER
+        /* MSan doesn't like stpncpy... See also https://github.com/google/sanitizers/issues/926 */
+        memzero(s, pl + strlen(instance) + strlen(suffix) + 1);
+#endif
 
-        /* Make sure the resulting name still is valid, i.e. didn't grow too large */
-        if (!unit_name_is_valid(s, UNIT_NAME_INSTANCE))
+        strcpy(stpcpy(stpncpy(s, original, pl), instance), suffix);
+
+        /* Make sure the resulting name still is valid, i.e. didn't grow too large. Globs will be expanded
+         * by clients when used, so the check is pointless. */
+        if (!accept_glob && !unit_name_is_valid(s, UNIT_NAME_INSTANCE))
                 return -EINVAL;
 
         *ret = TAKE_PTR(s);
@@ -509,6 +520,68 @@ int unit_name_template(const char *f, char **ret) {
         return 0;
 }
 
+bool unit_name_is_hashed(const char *name) {
+        const char *s;
+
+        if (!unit_name_is_valid(name, UNIT_NAME_PLAIN))
+                return false;
+
+        assert_se(s = strrchr(name, '.'));
+
+        if (s - name < UNIT_NAME_HASH_LENGTH_CHARS + 1)
+                return false;
+
+        s -= UNIT_NAME_HASH_LENGTH_CHARS;
+        if (s[-1] != '_')
+                return false;
+
+        for (size_t i = 0; i < UNIT_NAME_HASH_LENGTH_CHARS; i++)
+                if (!strchr(LOWERCASE_HEXDIGITS, s[i]))
+                        return false;
+
+        return true;
+}
+
+int unit_name_hash_long(const char *name, char **ret) {
+        _cleanup_free_ char *n = NULL, *hash = NULL;
+        const char *suffix;
+        le64_t h;
+        size_t len;
+
+        if (strlen(name) < UNIT_NAME_MAX)
+                return -EMSGSIZE;
+
+        suffix = strrchr(name, '.');
+        if (!suffix)
+                return -EINVAL;
+
+        if (unit_type_from_string(suffix+1) < 0)
+                return -EINVAL;
+
+        h = htole64(siphash24_string(name, LONG_UNIT_NAME_HASH_KEY.bytes));
+
+        hash = hexmem(&h, sizeof(h));
+        if (!hash)
+                return -ENOMEM;
+
+        assert_se(strlen(hash) == UNIT_NAME_HASH_LENGTH_CHARS);
+
+        len = UNIT_NAME_MAX - 1 - strlen(suffix+1) - UNIT_NAME_HASH_LENGTH_CHARS - 2;
+        assert(len > 0 && len < UNIT_NAME_MAX);
+
+        n = strndup(name, len);
+        if (!n)
+                return -ENOMEM;
+
+        if (!strextend(&n, "_", hash, suffix))
+                return -ENOMEM;
+        assert_se(unit_name_is_valid(n, UNIT_NAME_PLAIN));
+
+        *ret = TAKE_PTR(n);
+
+        return 0;
+}
+
 int unit_name_from_path(const char *path, const char *suffix, char **ret) {
         _cleanup_free_ char *p = NULL, *s = NULL;
         int r;
@@ -528,7 +601,19 @@ int unit_name_from_path(const char *path, const char *suffix, char **ret) {
         if (!s)
                 return -ENOMEM;
 
-        /* Refuse this if this got too long or for some other reason didn't result in a valid name */
+        if (strlen(s) >= UNIT_NAME_MAX) {
+                _cleanup_free_ char *n = NULL;
+
+                log_debug("Unit name \"%s\" too long, falling back to hashed unit name.", s);
+
+                r = unit_name_hash_long(s, &n);
+                if (r < 0)
+                        return r;
+
+                free_and_replace(s, n);
+        }
+
+        /* Refuse if this for some other reason didn't result in a valid name */
         if (!unit_name_is_valid(s, UNIT_NAME_PLAIN))
                 return -EINVAL;
 
@@ -559,7 +644,10 @@ int unit_name_from_path_instance(const char *prefix, const char *path, const cha
         if (!s)
                 return -ENOMEM;
 
-        /* Refuse this if this got too long or for some other reason didn't result in a valid name */
+        if (strlen(s) >= UNIT_NAME_MAX) /* Return a slightly more descriptive error for this specific condition */
+                return -ENAMETOOLONG;
+
+        /* Refuse if this for some other reason didn't result in a valid name */
         if (!unit_name_is_valid(s, UNIT_NAME_INSTANCE))
                 return -EINVAL;
 
@@ -576,6 +664,9 @@ int unit_name_to_path(const char *name, char **ret) {
         r = unit_name_to_prefix(name, &prefix);
         if (r < 0)
                 return r;
+
+        if (unit_name_is_hashed(name))
+                return -ENAMETOOLONG;
 
         return unit_name_path_unescape(prefix, ret);
 }
@@ -615,9 +706,15 @@ static bool do_escape_mangle(const char *f, bool allow_globs, char *t) {
  *
  *  If @allow_globs, globs characters are preserved. Otherwise, they are escaped.
  */
-int unit_name_mangle_with_suffix(const char *name, const char *operation, UnitNameMangle flags, const char *suffix, char **ret) {
+int unit_name_mangle_with_suffix(
+                const char *name,
+                const char *operation,
+                UnitNameMangle flags,
+                const char *suffix,
+                char **ret) {
+
         _cleanup_free_ char *s = NULL;
-        bool mangled, suggest_escape = true;
+        bool mangled, suggest_escape = true, warn = flags & UNIT_NAME_MANGLE_WARN;
         int r;
 
         assert(name);
@@ -638,22 +735,28 @@ int unit_name_mangle_with_suffix(const char *name, const char *operation, UnitNa
         if (string_is_glob(name) && in_charset(name, VALID_CHARS_GLOB)) {
                 if (flags & UNIT_NAME_MANGLE_GLOB)
                         goto good;
-                log_full(flags & UNIT_NAME_MANGLE_WARN ? LOG_NOTICE : LOG_DEBUG,
+                log_full(warn ? LOG_NOTICE : LOG_DEBUG,
                          "Glob pattern passed%s%s, but globs are not supported for this.",
                          operation ? " " : "", strempty(operation));
                 suggest_escape = false;
         }
 
-        if (is_device_path(name)) {
-                r = unit_name_from_path(name, ".device", ret);
-                if (r >= 0)
-                        return 1;
-                if (r != -EINVAL)
-                        return r;
-        }
-
         if (path_is_absolute(name)) {
-                r = unit_name_from_path(name, ".mount", ret);
+                _cleanup_free_ char *n = NULL;
+
+                r = path_simplify_alloc(name, &n);
+                if (r < 0)
+                        return r;
+
+                if (is_device_path(n)) {
+                        r = unit_name_from_path(n, ".device", ret);
+                        if (r >= 0)
+                                return 1;
+                        if (r != -EINVAL)
+                                return r;
+                }
+
+                r = unit_name_from_path(n, ".mount", ret);
                 if (r >= 0)
                         return 1;
                 if (r != -EINVAL)
@@ -666,7 +769,7 @@ int unit_name_mangle_with_suffix(const char *name, const char *operation, UnitNa
 
         mangled = do_escape_mangle(name, flags & UNIT_NAME_MANGLE_GLOB, s);
         if (mangled)
-                log_full(flags & UNIT_NAME_MANGLE_WARN ? LOG_NOTICE : LOG_DEBUG,
+                log_full(warn ? LOG_NOTICE : LOG_DEBUG,
                          "Invalid unit name \"%s\" escaped as \"%s\"%s.",
                          name, s,
                          suggest_escape ? " (maybe you should use systemd-escape?)" : "");
@@ -685,19 +788,10 @@ int unit_name_mangle_with_suffix(const char *name, const char *operation, UnitNa
         return 1;
 
 good:
-        s = strdup(name);
-        if (!s)
-                return -ENOMEM;
-
-        *ret = TAKE_PTR(s);
-        return 0;
+        return strdup_to(ret, name);
 }
 
 int slice_build_parent_slice(const char *slice, char **ret) {
-        _cleanup_free_ char *s = NULL;
-        char *dash;
-        int r;
-
         assert(slice);
         assert(ret);
 
@@ -709,18 +803,16 @@ int slice_build_parent_slice(const char *slice, char **ret) {
                 return 0;
         }
 
-        s = strdup(slice);
+        _cleanup_free_ char *s = strdup(slice);
         if (!s)
                 return -ENOMEM;
 
-        dash = strrchr(s, '-');
-        if (dash)
-                strcpy(dash, ".slice");
-        else {
-                r = free_and_strdup(&s, SPECIAL_ROOT_SLICE);
-                if (r < 0)
-                        return r;
-        }
+        char *dash = strrchr(s, '-');
+        if (!dash)
+                return strdup_to_full(ret, SPECIAL_ROOT_SLICE);
+
+        /* We know that s ended with .slice before truncation, so we have enough space. */
+        strcpy(dash, ".slice");
 
         *ret = TAKE_PTR(s);
         return 1;
@@ -742,7 +834,7 @@ int slice_build_subslice(const char *slice, const char *name, char **ret) {
         if (streq(slice, SPECIAL_ROOT_SLICE))
                 subslice = strjoin(name, ".slice");
         else {
-                char *e;
+                const char *e;
 
                 assert_se(e = endswith(slice, ".slice"));
 
@@ -793,4 +885,27 @@ bool slice_name_is_valid(const char *name) {
                 return false;
 
         return true;
+}
+
+bool unit_name_prefix_equal(const char *a, const char *b) {
+        const char *p, *q;
+
+        assert(a);
+        assert(b);
+
+        if (!unit_name_is_valid(a, UNIT_NAME_ANY) || !unit_name_is_valid(b, UNIT_NAME_ANY))
+                return false;
+
+        p = strchr(a, '@');
+        if (!p)
+                p = strrchr(a, '.');
+
+        q = strchr(b, '@');
+        if (!q)
+                q = strrchr(b, '.');
+
+        assert(p);
+        assert(q);
+
+        return memcmp_nn(a, p - a, b, q - b) == 0;
 }

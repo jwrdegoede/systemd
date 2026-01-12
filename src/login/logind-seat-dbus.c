@@ -1,22 +1,25 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
+#include "sd-bus.h"
 
 #include "alloc-util.h"
 #include "bus-common-errors.h"
 #include "bus-get-properties.h"
 #include "bus-label.h"
+#include "bus-object.h"
 #include "bus-polkit.h"
-#include "bus-util.h"
-#include "logind-dbus.h"
-#include "logind-seat-dbus.h"
-#include "logind-seat.h"
-#include "logind-session-dbus.h"
+#include "hashmap.h"
+#include "logind-session.h"
 #include "logind.h"
-#include "missing_capability.h"
+#include "logind-dbus.h"
+#include "logind-polkit.h"
+#include "logind-seat.h"
+#include "logind-seat-dbus.h"
+#include "logind-session-dbus.h"
+#include "logind-user.h"
+#include "string-util.h"
 #include "strv.h"
 #include "user-util.h"
-#include "util.h"
 
 static BUS_DEFINE_PROPERTY_GET_GLOBAL(property_get_const_true, "b", true);
 static BUS_DEFINE_PROPERTY_GET(property_get_can_tty, "b", Seat, seat_can_tty);
@@ -32,11 +35,10 @@ static int property_get_active_session(
                 sd_bus_error *error) {
 
         _cleanup_free_ char *p = NULL;
-        Seat *s = userdata;
+        Seat *s = ASSERT_PTR(userdata);
 
         assert(bus);
         assert(reply);
-        assert(s);
 
         p = s->active ? session_bus_path(s->active) : strdup("/");
         if (!p)
@@ -54,13 +56,11 @@ static int property_get_sessions(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Seat *s = userdata;
-        Session *session;
+        Seat *s = ASSERT_PTR(userdata);
         int r;
 
         assert(bus);
         assert(reply);
-        assert(s);
 
         r = sd_bus_message_open_container(reply, 'a', "(so)");
         if (r < 0)
@@ -95,11 +95,10 @@ static int property_get_idle_hint(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Seat *s = userdata;
+        Seat *s = ASSERT_PTR(userdata);
 
         assert(bus);
         assert(reply);
-        assert(s);
 
         return sd_bus_message_append(reply, "b", seat_get_idle_hint(s, NULL) > 0);
 }
@@ -113,14 +112,13 @@ static int property_get_idle_since_hint(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Seat *s = userdata;
+        Seat *s = ASSERT_PTR(userdata);
         dual_timestamp t;
         uint64_t u;
         int r;
 
         assert(bus);
         assert(reply);
-        assert(s);
 
         r = seat_get_idle_hint(s, &t);
         if (r < 0)
@@ -132,19 +130,15 @@ static int property_get_idle_since_hint(
 }
 
 int bus_seat_method_terminate(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Seat *s = userdata;
+        Seat *s = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(s);
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_KILL,
                         "org.freedesktop.login1.manage",
-                        NULL,
-                        false,
-                        UID_INVALID,
+                        /* details= */ NULL,
                         &s->manager->polkit_registry,
                         error);
         if (r < 0)
@@ -152,7 +146,7 @@ int bus_seat_method_terminate(sd_bus_message *message, void *userdata, sd_bus_er
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = seat_stop_sessions(s, /* force = */ true);
+        r = seat_stop_sessions(s, /* force= */ true);
         if (r < 0)
                 return r;
 
@@ -160,13 +154,12 @@ int bus_seat_method_terminate(sd_bus_message *message, void *userdata, sd_bus_er
 }
 
 static int method_activate_session(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Seat *s = userdata;
+        Seat *s = ASSERT_PTR(userdata);
         const char *name;
         Session *session;
         int r;
 
         assert(message);
-        assert(s);
 
         r = sd_bus_message_read(message, "s", &name);
         if (r < 0)
@@ -179,15 +172,7 @@ static int method_activate_session(sd_bus_message *message, void *userdata, sd_b
         if (session->seat != s)
                 return sd_bus_error_setf(error, BUS_ERROR_SESSION_NOT_ON_SEAT, "Session %s not on seat %s", name, s->id);
 
-        r = bus_verify_polkit_async(
-                        message,
-                        CAP_SYS_ADMIN,
-                        "org.freedesktop.login1.chvt",
-                        NULL,
-                        false,
-                        UID_INVALID,
-                        &s->manager->polkit_registry,
-                        error);
+        r = check_polkit_chvt(message, s->manager, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -201,29 +186,20 @@ static int method_activate_session(sd_bus_message *message, void *userdata, sd_b
 }
 
 static int method_switch_to(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Seat *s = userdata;
+        Seat *s = ASSERT_PTR(userdata);
         unsigned to;
         int r;
 
         assert(message);
-        assert(s);
 
         r = sd_bus_message_read(message, "u", &to);
         if (r < 0)
                 return r;
 
         if (to <= 0)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid virtual terminal");
+                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid virtual terminal");
 
-        r = bus_verify_polkit_async(
-                        message,
-                        CAP_SYS_ADMIN,
-                        "org.freedesktop.login1.chvt",
-                        NULL,
-                        false,
-                        UID_INVALID,
-                        &s->manager->polkit_registry,
-                        error);
+        r = check_polkit_chvt(message, s->manager, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -237,21 +213,12 @@ static int method_switch_to(sd_bus_message *message, void *userdata, sd_bus_erro
 }
 
 static int method_switch_to_next(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Seat *s = userdata;
+        Seat *s = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(s);
 
-        r = bus_verify_polkit_async(
-                        message,
-                        CAP_SYS_ADMIN,
-                        "org.freedesktop.login1.chvt",
-                        NULL,
-                        false,
-                        UID_INVALID,
-                        &s->manager->polkit_registry,
-                        error);
+        r = check_polkit_chvt(message, s->manager, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -265,21 +232,12 @@ static int method_switch_to_next(sd_bus_message *message, void *userdata, sd_bus
 }
 
 static int method_switch_to_previous(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Seat *s = userdata;
+        Seat *s = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(s);
 
-        r = bus_verify_polkit_async(
-                        message,
-                        CAP_SYS_ADMIN,
-                        "org.freedesktop.login1.chvt",
-                        NULL,
-                        false,
-                        UID_INVALID,
-                        &s->manager->polkit_registry,
-                        error);
+        r = check_polkit_chvt(message, s->manager, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -295,7 +253,7 @@ static int method_switch_to_previous(sd_bus_message *message, void *userdata, sd
 static int seat_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
         _cleanup_free_ char *e = NULL;
         sd_bus_message *message;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         const char *p;
         Seat *seat;
         int r;
@@ -304,7 +262,6 @@ static int seat_object_find(sd_bus *bus, const char *path, const char *interface
         assert(path);
         assert(interface);
         assert(found);
-        assert(m);
 
         p = startswith(path, "/org/freedesktop/login1/seat/");
         if (!p)
@@ -328,7 +285,7 @@ static int seat_object_find(sd_bus *bus, const char *path, const char *interface
         return 1;
 }
 
-char *seat_bus_path(Seat *s) {
+char* seat_bus_path(Seat *s) {
         _cleanup_free_ char *t = NULL;
 
         assert(s);
@@ -427,9 +384,8 @@ int seat_send_signal(Seat *s, bool new_seat) {
                         "so", s->id, p);
 }
 
-int seat_send_changed(Seat *s, const char *properties, ...) {
+int seat_send_changed_strv(Seat *s, char **properties) {
         _cleanup_free_ char *p = NULL;
-        char **l;
 
         assert(s);
 
@@ -440,9 +396,7 @@ int seat_send_changed(Seat *s, const char *properties, ...) {
         if (!p)
                 return -ENOMEM;
 
-        l = strv_from_stdarg_alloca(properties);
-
-        return sd_bus_emit_properties_changed_strv(s->manager->bus, p, "org.freedesktop.login1.Seat", l);
+        return sd_bus_emit_properties_changed_strv(s->manager->bus, p, "org.freedesktop.login1.Seat", properties);
 }
 
 static const sd_bus_vtable seat_vtable[] = {
@@ -460,18 +414,16 @@ static const sd_bus_vtable seat_vtable[] = {
 
         SD_BUS_METHOD("Terminate", NULL, NULL, bus_seat_method_terminate, SD_BUS_VTABLE_UNPRIVILEGED),
 
-        SD_BUS_METHOD_WITH_NAMES("ActivateSession",
-                                 "s",
-                                 SD_BUS_PARAM(session_id),
-                                 NULL,,
-                                 method_activate_session,
-                                 SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD_WITH_NAMES("SwitchTo",
-                                 "u",
-                                 SD_BUS_PARAM(vtnr),
-                                 NULL,,
-                                 method_switch_to,
-                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("ActivateSession",
+                                SD_BUS_ARGS("s", session_id),
+                                SD_BUS_NO_RESULT,
+                                method_activate_session,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("SwitchTo",
+                                SD_BUS_ARGS("u", vtnr),
+                                SD_BUS_NO_RESULT,
+                                method_switch_to,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
 
         SD_BUS_METHOD("SwitchToNext", NULL, NULL, method_switch_to_next, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("SwitchToPrevious", NULL, NULL, method_switch_to_previous, SD_BUS_VTABLE_UNPRIVILEGED),

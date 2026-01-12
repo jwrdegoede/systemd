@@ -2,7 +2,6 @@
 
 #include "alloc-util.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "fuzz.h"
 #include "hostname-setup.h"
 
@@ -10,18 +9,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_free_ char *ret = NULL;
 
-        if (size == 0)
-                return 0;
-
-        f = fmemopen_unlocked((char*) data, size, "re");
+        f = data_to_file(data, size);
         assert_se(f);
 
-        /* We don't want to fill the logs with messages about parse errors.
-         * Disable most logging if not running standalone */
-        if (!getenv("SYSTEMD_LOG_LEVEL"))
-                log_set_max_level(LOG_CRIT);
+        fuzz_setup_logging();
 
-        (void) read_etc_hostname_stream(f, &ret);
+        (void) read_etc_hostname_stream(f, /* substitute_wildcards= */ true, &ret);
 
         return 0;
 }

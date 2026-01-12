@@ -1,66 +1,59 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 #include <syslog.h>
 
-#include "macro.h"
-
-/* Some structures we reference but don't want to pull in headers for */
-struct iovec;
-struct signalfd_siginfo;
-
-typedef enum LogRealm {
-        LOG_REALM_SYSTEMD,
-        LOG_REALM_UDEV,
-        _LOG_REALM_MAX,
-} LogRealm;
-
-#ifndef LOG_REALM
-#  define LOG_REALM LOG_REALM_SYSTEMD
-#endif
+#include "basic-forward.h"
 
 typedef enum LogTarget{
         LOG_TARGET_CONSOLE,
-        LOG_TARGET_CONSOLE_PREFIXED,
         LOG_TARGET_KMSG,
         LOG_TARGET_JOURNAL,
-        LOG_TARGET_JOURNAL_OR_KMSG,
         LOG_TARGET_SYSLOG,
+        LOG_TARGET_CONSOLE_PREFIXED,
+        LOG_TARGET_JOURNAL_OR_KMSG,
         LOG_TARGET_SYSLOG_OR_KMSG,
         LOG_TARGET_AUTO, /* console if stderr is not journal, JOURNAL_OR_KMSG otherwise */
         LOG_TARGET_NULL,
-        _LOG_TARGET_MAX,
-        _LOG_TARGET_INVALID = -1
+        _LOG_TARGET_SINGLE_MAX = LOG_TARGET_SYSLOG + 1,
+        _LOG_TARGET_MAX = LOG_TARGET_NULL + 1,
+        _LOG_TARGET_INVALID = -EINVAL,
 } LogTarget;
 
-/* Note to readers: << and >> have lower precedence than & and | */
-#define LOG_REALM_PLUS_LEVEL(realm, level)  ((realm) << 10 | (level))
-#define LOG_REALM_REMOVE_LEVEL(realm_level) ((realm_level) >> 10)
-#define SYNTHETIC_ERRNO(num)                (1 << 30 | (num))
-#define IS_SYNTHETIC_ERRNO(val)             ((val) >> 30 & 1)
-#define ERRNO_VALUE(val)                    (abs(val) & 255)
+/* This log level disables logging completely. It can only be passed to log_set_max_level() and cannot be
+ * used as a regular log level. */
+#define LOG_NULL (LOG_EMERG - 1)
+assert_cc(LOG_NULL == -1);
 
-void log_set_target(LogTarget target);
+#define SYNTHETIC_ERRNO(num)                (ABS(num) | (1 << 30))
+#define IS_SYNTHETIC_ERRNO(val)             (((val) >> 30) == 1)
+#define ERRNO_VALUE(val)                    (ABS(val) & ~(1 << 30))
 
-void log_set_max_level_realm(LogRealm realm, int level);
+/* The callback function to be invoked when syntax warnings are seen
+ * in the unit files. */
+typedef void (*log_syntax_callback_t)(const char *unit, int level, void *userdata);
+void set_log_syntax_callback(log_syntax_callback_t cb, void *userdata);
 
-#define log_set_max_level(level)                \
-        log_set_max_level_realm(LOG_REALM, (level))
-
-static inline void log_set_max_level_all_realms(int level) {
-        for (LogRealm realm = 0; realm < _LOG_REALM_MAX; realm++)
-                log_set_max_level_realm(realm, level);
+static inline void clear_log_syntax_callback(dummy_t *dummy) {
+          set_log_syntax_callback(/* cb= */ NULL, /* userdata= */ NULL);
 }
 
-void log_set_facility(int facility);
-
+DECLARE_STRING_TABLE_LOOKUP(log_target, LogTarget);
+void log_set_target(LogTarget target);
+void log_set_target_and_open(LogTarget target);
 int log_set_target_from_string(const char *e);
-int log_set_max_level_from_string_realm(LogRealm realm, const char *e);
-#define log_set_max_level_from_string(e)        \
-        log_set_max_level_from_string_realm(LOG_REALM, (e))
+LogTarget log_get_target(void) _pure_;
+void log_settle_target(void);
+
+int log_set_max_level(int level);
+int log_set_max_level_from_string(const char *e);
+int log_get_max_level(void) _pure_;
+int log_get_target_max_level(LogTarget target);
+int log_max_levels_to_string(int level, char **ret);
+
+void log_set_facility(int facility);
 
 void log_show_color(bool b);
 bool log_get_show_color(void) _pure_;
@@ -76,29 +69,17 @@ int log_show_location_from_string(const char *e);
 int log_show_time_from_string(const char *e);
 int log_show_tid_from_string(const char *e);
 
-LogTarget log_get_target(void) _pure_;
-int log_get_max_level_realm(LogRealm realm) _pure_;
-#define log_get_max_level()                     \
-        log_get_max_level_realm(LOG_REALM)
-
 /* Functions below that open and close logs or configure logging based on the
  * environment should not be called from library code — this is always a job
- * for the application itself.
- */
+ * for the application itself. */
 
-assert_cc(STRLEN(__FILE__) > STRLEN(RELATIVE_SOURCE_PATH) + 1);
-#define PROJECT_FILE (&__FILE__[STRLEN(RELATIVE_SOURCE_PATH) + 1])
-
+bool stderr_is_journal(void);
 int log_open(void);
 void log_close(void);
 void log_forget_fds(void);
 
-void log_parse_environment_realm(LogRealm realm);
-void log_parse_environment_cli_realm(LogRealm realm);
-#define log_parse_environment() \
-        log_parse_environment_realm(LOG_REALM)
-#define log_parse_environment_cli() \
-        log_parse_environment_cli_realm(LOG_REALM)
+void log_parse_environment_variables(void);
+void log_parse_environment(void);
 
 int log_dispatch_internal(
                 int level,
@@ -108,21 +89,19 @@ int log_dispatch_internal(
                 const char *func,
                 const char *object_field,
                 const char *object,
-                const char *extra,
                 const char *extra_field,
+                const char *extra,
                 char *buffer);
 
-int log_internal_realm(
+int log_internal(
                 int level,
                 int error,
                 const char *file,
                 int line,
                 const char *func,
                 const char *format, ...) _printf_(6,7);
-#define log_internal(level, ...) \
-        log_internal_realm(LOG_REALM_PLUS_LEVEL(LOG_REALM, (level)), __VA_ARGS__)
 
-int log_internalv_realm(
+int log_internalv(
                 int level,
                 int error,
                 const char *file,
@@ -130,10 +109,7 @@ int log_internalv_realm(
                 const char *func,
                 const char *format,
                 va_list ap) _printf_(6,0);
-#define log_internalv(level, ...) \
-        log_internalv_realm(LOG_REALM_PLUS_LEVEL(LOG_REALM, (level)), __VA_ARGS__)
 
-/* Realm is fixed to LOG_REALM_SYSTEMD for those */
 int log_object_internalv(
                 int level,
                 int error,
@@ -165,7 +141,7 @@ int log_struct_internal(
                 const char *file,
                 int line,
                 const char *func,
-                const char *format, ...) _printf_(6,0) _sentinel_;
+                const char *format, ...) _sentinel_;
 
 int log_oom_internal(
                 int level,
@@ -200,56 +176,49 @@ int log_dump_internal(
                 const char *func,
                 char *buffer);
 
-/* Logging for various assertions */
-_noreturn_ void log_assert_failed_realm(
-                LogRealm realm,
-                const char *text,
-                const char *file,
-                int line,
-                const char *func);
-#define log_assert_failed(text, ...) \
-        log_assert_failed_realm(LOG_REALM, (text), __VA_ARGS__)
-
-_noreturn_ void log_assert_failed_unreachable_realm(
-                LogRealm realm,
-                const char *text,
-                const char *file,
-                int line,
-                const char *func);
-#define log_assert_failed_unreachable(text, ...) \
-        log_assert_failed_unreachable_realm(LOG_REALM, (text), __VA_ARGS__)
-
-void log_assert_failed_return_realm(
-                LogRealm realm,
-                const char *text,
-                const char *file,
-                int line,
-                const char *func);
-#define log_assert_failed_return(text, ...) \
-        log_assert_failed_return_realm(LOG_REALM, (text), __VA_ARGS__)
-
 #define log_dispatch(level, error, buffer)                              \
         log_dispatch_internal(level, error, PROJECT_FILE, __LINE__, __func__, NULL, NULL, NULL, NULL, buffer)
 
 /* Logging with level */
-#define log_full_errno_realm(realm, level, error, ...)                  \
+#define log_full_errno_zerook(level, error, ...)                        \
         ({                                                              \
-                int _level = (level), _e = (error), _realm = (realm);   \
-                (log_get_max_level_realm(_realm) >= LOG_PRI(_level))    \
-                        ? log_internal_realm(LOG_REALM_PLUS_LEVEL(_realm, _level), _e, \
-                                             PROJECT_FILE, __LINE__, __func__, __VA_ARGS__) \
+                int _level = (level), _e = (error);                     \
+                _e = (log_get_max_level() >= LOG_PRI(_level))           \
+                        ? log_internal(_level, _e, PROJECT_FILE, __LINE__, __func__, __VA_ARGS__) \
                         : -ERRNO_VALUE(_e);                             \
+                _e < 0 ? _e : -ESTRPIPE;                                \
         })
 
-#define log_full_errno(level, error, ...)                               \
-        log_full_errno_realm(LOG_REALM, (level), (error), __VA_ARGS__)
+#if BUILD_MODE_DEVELOPER && !defined(TEST_CODE)
+#  define ASSERT_NON_ZERO(x) assert((x) != 0)
+#  define ASSERT_UNDERFLOW(x) assert((x) >= INT_MIN)
+#else
+#  define ASSERT_NON_ZERO(x)
+#  define ASSERT_UNDERFLOW(x)
+#endif
 
-#define log_full(level, ...) (void) log_full_errno((level), 0, __VA_ARGS__)
+/* We often call log macros with ssize_t instead of int, so check for underflows,
+ * as ssize_t is not guaranteed to be the same as int, and we usually do
+ * 'return log_errno...' from functions that return 'int' */
+#define log_full_errno(level, error, ...)                               \
+        ({                                                              \
+                int64_t _error = (error);                               \
+                ASSERT_UNDERFLOW(_error);                               \
+                ASSERT_NON_ZERO(_error);                                \
+                log_full_errno_zerook(level, (int)_error, __VA_ARGS__); \
+        })
+
+#define log_full(level, fmt, ...)                                      \
+        ({                                                             \
+                if (BUILD_MODE_DEVELOPER)                              \
+                        assert(!strstr(fmt, "%m"));                    \
+                (void) log_full_errno_zerook(level, 0, fmt, ##__VA_ARGS__); \
+        })
 
 int log_emergency_level(void);
 
 /* Normal logging */
-#define log_debug(...)     log_full_errno(LOG_DEBUG, 0, __VA_ARGS__)
+#define log_debug(...)     log_full(LOG_DEBUG,   __VA_ARGS__)
 #define log_info(...)      log_full(LOG_INFO,    __VA_ARGS__)
 #define log_notice(...)    log_full(LOG_NOTICE,  __VA_ARGS__)
 #define log_warning(...)   log_full(LOG_WARNING, __VA_ARGS__)
@@ -264,38 +233,74 @@ int log_emergency_level(void);
 #define log_error_errno(error, ...)     log_full_errno(LOG_ERR,     error, __VA_ARGS__)
 #define log_emergency_errno(error, ...) log_full_errno(log_emergency_level(), error, __VA_ARGS__)
 
-#ifdef LOG_TRACE
-#  define log_trace(...) log_debug(__VA_ARGS__)
+/* This logs at the specified level the first time it is called, and then
+ * logs at debug. If the specified level is debug, this logs only the first
+ * time it is called. */
+#define log_once(level, ...)                                             \
+        ({                                                               \
+                if (ONCE)                                                \
+                        log_full(level, __VA_ARGS__);                    \
+                else if (LOG_PRI(level) != LOG_DEBUG)                    \
+                        log_debug(__VA_ARGS__);                          \
+        })
+
+#define log_once_errno(level, error, ...)                                \
+        ({                                                               \
+                int _err = (error);                                      \
+                if (ONCE)                                                \
+                        _err = log_full_errno(level, _err, __VA_ARGS__); \
+                else if (LOG_PRI(level) != LOG_DEBUG)                    \
+                        _err = log_debug_errno(_err, __VA_ARGS__);       \
+                else                                                     \
+                        _err = -ERRNO_VALUE(_err);                       \
+                _err;                                                    \
+        })
+
+#if LOG_TRACE
+#  define log_trace(...)          log_debug(__VA_ARGS__)
+#  define log_trace_errno(...)    log_debug_errno(__VA_ARGS__)
 #else
-#  define log_trace(...) do {} while (0)
+#  define log_trace(...)          do {} while (0)
+#  define log_trace_errno(e, ...) (-ERRNO_VALUE(e))
 #endif
 
 /* Structured logging */
-#define log_struct_errno(level, error, ...) \
-        log_struct_internal(LOG_REALM_PLUS_LEVEL(LOG_REALM, level), \
-                            error, PROJECT_FILE, __LINE__, __func__, __VA_ARGS__, NULL)
+#define log_struct_errno(level, error, ...)                             \
+        log_struct_internal(level, error, PROJECT_FILE, __LINE__, __func__, __VA_ARGS__, NULL)
 #define log_struct(level, ...) log_struct_errno(level, 0, __VA_ARGS__)
 
 #define log_struct_iovec_errno(level, error, iovec, n_iovec)            \
-        log_struct_iovec_internal(LOG_REALM_PLUS_LEVEL(LOG_REALM, level), \
-                                  error, PROJECT_FILE, __LINE__, __func__, iovec, n_iovec)
+        log_struct_iovec_internal(level, error, PROJECT_FILE, __LINE__, __func__, iovec, n_iovec)
 #define log_struct_iovec(level, iovec, n_iovec) log_struct_iovec_errno(level, 0, iovec, n_iovec)
 
 /* This modifies the buffer passed! */
-#define log_dump(level, buffer) \
-        log_dump_internal(LOG_REALM_PLUS_LEVEL(LOG_REALM, level), \
-                          0, PROJECT_FILE, __LINE__, __func__, buffer)
+#define log_dump(level, buffer)                                         \
+        log_dump_internal(level, 0, PROJECT_FILE, __LINE__, __func__, buffer)
 
-#define log_oom() log_oom_internal(LOG_REALM_PLUS_LEVEL(LOG_REALM, LOG_ERR), PROJECT_FILE, __LINE__, __func__)
-#define log_oom_debug() log_oom_internal(LOG_REALM_PLUS_LEVEL(LOG_REALM, LOG_DEBUG), PROJECT_FILE, __LINE__, __func__)
+#define log_oom_full(level) log_oom_internal(level, PROJECT_FILE, __LINE__, __func__)
+#define log_oom()           log_oom_full(LOG_ERR)
+#define log_oom_debug()     log_oom_full(LOG_DEBUG)
+#define log_oom_warning()   log_oom_full(LOG_WARNING)
 
 bool log_on_console(void) _pure_;
 
-const char *log_target_to_string(LogTarget target) _const_;
-LogTarget log_target_from_string(const char *s) _pure_;
+/* Helper to wrap the main message in structured logging. The macro doesn't do much,
+ * except to provide visual grouping of the format string and its arguments. */
+#ifdef __COVERITY__
+/* Coverity does not like the concatenation of multiple formats and arguments. Let's replace each format
+ * string with a dummy string. The validity of the formats is hopefully checked by other CIs. */
+#  define LOG_ITEM(fmt, ...)    "dummy", NULL, ##__VA_ARGS__
+#elif LOG_MESSAGE_VERIFICATION
+/* Do a fake formatting of the message string to let the scanner verify the arguments against the format
+ * message. The variable will never be set to true, but we don't tell the compiler that :) */
+extern bool _log_message_dummy;
+#  define LOG_ITEM(fmt, ...) "%.0d" fmt, (_log_message_dummy && printf(fmt, ##__VA_ARGS__)), ##__VA_ARGS__
+#else
+#  define LOG_ITEM(fmt, ...) fmt, ##__VA_ARGS__
+#endif
 
-/* Helper to prepare various field for structured logging */
-#define LOG_MESSAGE(fmt, ...) "MESSAGE=" fmt, ##__VA_ARGS__
+#define LOG_MESSAGE(fmt, ...) LOG_ITEM("MESSAGE=" fmt, ##__VA_ARGS__)
+#define LOG_MESSAGE_ID(id)    LOG_ITEM("MESSAGE_ID=" id)
 
 void log_received_signal(int level, const struct signalfd_siginfo *si);
 
@@ -336,6 +341,18 @@ int log_syntax_invalid_utf8_internal(
                 const char *func,
                 const char *rvalue);
 
+int log_syntax_parse_error_internal(
+                const char *unit,
+                const char *config_file,
+                unsigned config_line,
+                int error,
+                bool critical, /* When true, propagate the passed error, otherwise this always returns 0. */
+                const char *file,
+                int line,
+                const char *func,
+                const char *lvalue,
+                const char *rvalue);
+
 #define log_syntax(unit, level, config_file, config_line, error, ...)   \
         ({                                                              \
                 int _level = (level), _e = (error);                     \
@@ -352,7 +369,22 @@ int log_syntax_invalid_utf8_internal(
                         : -EINVAL;                                      \
         })
 
+#define log_syntax_parse_error_full(unit, config_file, config_line, error, critical, lvalue, rvalue) \
+        log_syntax_parse_error_internal(unit, config_file, config_line, error, critical, PROJECT_FILE, __LINE__, __func__, lvalue, rvalue)
+
+#define log_syntax_parse_error(unit, config_file, config_line, error, lvalue, rvalue) \
+        log_syntax_parse_error_full(unit, config_file, config_line, error, /* critical= */ false, lvalue, rvalue)
+
 #define DEBUG_LOGGING _unlikely_(log_get_max_level() >= LOG_DEBUG)
 
-void log_setup_service(void);
-void log_setup_cli(void);
+void log_setup(void);
+
+const char* _log_set_prefix(const char *prefix, bool force);
+static inline const char* _log_unset_prefixp(const char **p) {
+        assert(p);
+        _log_set_prefix(*p, true);
+        return NULL;
+}
+
+#define LOG_SET_PREFIX(prefix) \
+        _cleanup_(_log_unset_prefixp) _unused_ const char *CONCATENATE(_cleanup_log_unset_prefix_, UNIQ) = _log_set_prefix(prefix, false);

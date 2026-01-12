@@ -1,9 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later
  * Copyright © 2020 VMware, Inc. */
 
+#include <linux/if_arp.h>
+
+#include "sd-netlink.h"
+
 #include "bareudp.h"
-#include "netlink-util.h"
-#include "networkd-manager.h"
+#include "conf-parser.h"
 #include "string-table.h"
 
 static const char* const bare_udp_protocol_table[_BARE_UDP_PROTOCOL_MAX] = {
@@ -14,96 +17,35 @@ static const char* const bare_udp_protocol_table[_BARE_UDP_PROTOCOL_MAX] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP(bare_udp_protocol, BareUDPProtocol);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_bare_udp_iftype, bare_udp_protocol, BareUDPProtocol,
-                         "Failed to parse EtherType=");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_bare_udp_iftype, bare_udp_protocol, BareUDPProtocol);
 
-/* callback for bareudp netdev's created without a backing Link */
-static int bare_udp_netdev_create_handler(sd_netlink *rtnl, sd_netlink_message *m, NetDev *netdev) {
+static int netdev_bare_udp_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *m) {
+        assert(m);
+
+        BareUDP *u = BAREUDP(netdev);
         int r;
-
-        assert(netdev);
-        assert(netdev->state != _NETDEV_STATE_INVALID);
-
-        r = sd_netlink_message_get_errno(m);
-        if (r == -EEXIST)
-                log_netdev_info(netdev, "BareUDP netdev exists, using existing without changing its parameters.");
-        else if (r < 0) {
-                log_netdev_warning_errno(netdev, r, "BareUDP netdev could not be created: %m");
-                netdev_drop(netdev);
-
-                return 1;
-        }
-
-        log_netdev_debug(netdev, "BareUDP created.");
-
-        return 1;
-}
-
-static int netdev_bare_udp_create(NetDev *netdev) {
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
-        BareUDP *u;
-        int r;
-
-        assert(netdev);
-
-        u = BAREUDP(netdev);
-
-        assert(u);
-
-        r = sd_rtnl_message_new_link(netdev->manager->rtnl, &m, RTM_NEWLINK, 0);
-        if (r < 0)
-                return log_netdev_error_errno(netdev, r, "Could not allocate RTM_NEWLINK message: %m");
-
-        r = sd_netlink_message_append_string(m, IFLA_IFNAME, netdev->ifname);
-        if (r < 0)
-                return log_netdev_error_errno(netdev, r, "Could not append IFLA_IFNAME, attribute: %m");
-
-        r = sd_netlink_message_open_container(m, IFLA_LINKINFO);
-        if (r < 0)
-                return log_netdev_error_errno(netdev, r, "Could not append IFLA_LINKINFO attribute: %m");
-
-        r = sd_netlink_message_open_container_union(m, IFLA_INFO_DATA, netdev_kind_to_string(netdev->kind));
-        if (r < 0)
-                return log_netdev_error_errno(netdev, r, "Could not append IFLA_INFO_DATA attribute: %m");
 
         r = sd_netlink_message_append_u16(m, IFLA_BAREUDP_ETHERTYPE, htobe16(u->iftype));
         if (r < 0)
-                return log_netdev_error_errno(netdev, r, "Could not append IFLA_BAREUDP_ETHERTYPE attribute: %m");
+                return r;
 
         r = sd_netlink_message_append_u16(m, IFLA_BAREUDP_PORT, htobe16(u->dest_port));
         if (r < 0)
-                return log_netdev_error_errno(netdev, r, "Could not append IFLA_BAREUDP_PORT attribute: %m");
+                return r;
 
-        r = sd_netlink_message_close_container(m);
-        if (r < 0)
-                return log_netdev_error_errno(netdev, r, "Could not append IFLA_INFO_DATA attribute: %m");
+        if (u->min_port > 0) {
+                r = sd_netlink_message_append_u16(m, IFLA_BAREUDP_SRCPORT_MIN, u->min_port);
+                if (r < 0)
+                        return r;
+        }
 
-        r = sd_netlink_message_close_container(m);
-        if (r < 0)
-                return log_netdev_error_errno(netdev, r, "Could not append IFLA_LINKINFO attribute: %m");
-
-        r = netlink_call_async(netdev->manager->rtnl, NULL, m, bare_udp_netdev_create_handler,
-                               netdev_destroy_callback, netdev);
-        if (r < 0)
-                return log_netdev_error_errno(netdev, r, "Could not send rtnetlink message: %m");
-
-        netdev_ref(netdev);
-        netdev->state = NETDEV_STATE_CREATING;
-
-        log_netdev_debug(netdev, "Creating");
-
-        return r;
+        return 0;
 }
 
 static int netdev_bare_udp_verify(NetDev *netdev, const char *filename) {
-        BareUDP *u;
-
-        assert(netdev);
         assert(filename);
 
-        u = BAREUDP(netdev);
-
-        assert(u);
+        BareUDP *u = BAREUDP(netdev);
 
         if (u->dest_port == 0)
                 return log_netdev_warning_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
@@ -117,13 +59,7 @@ static int netdev_bare_udp_verify(NetDev *netdev, const char *filename) {
 }
 
 static void bare_udp_init(NetDev *netdev) {
-        BareUDP *u;
-
-        assert(netdev);
-
-        u = BAREUDP(netdev);
-
-        assert(u);
+        BareUDP *u = BAREUDP(netdev);
 
         u->iftype = _BARE_UDP_PROTOCOL_INVALID;
 }
@@ -133,6 +69,8 @@ const NetDevVTable bare_udp_vtable = {
         .sections = NETDEV_COMMON_SECTIONS "BareUDP\0",
         .init = bare_udp_init,
         .config_verify = netdev_bare_udp_verify,
-        .create = netdev_bare_udp_create,
+        .fill_message_create = netdev_bare_udp_fill_message_create,
         .create_type = NETDEV_CREATE_INDEPENDENT,
+        .iftype = ARPHRD_NONE,
+        .keep_existing = true,
 };

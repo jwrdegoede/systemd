@@ -4,10 +4,7 @@
 /* A structure for specifying (possibly repetitive) points in calendar
  * time, a la cron */
 
-#include <stdbool.h>
-
-#include "time-util.h"
-#include "util.h"
+#include "shared-forward.h"
 
 typedef struct CalendarComponent {
         int start;
@@ -35,11 +32,10 @@ typedef struct CalendarSpec {
 
 CalendarSpec* calendar_spec_free(CalendarSpec *c);
 
-int calendar_spec_normalize(CalendarSpec *spec);
 bool calendar_spec_valid(CalendarSpec *spec);
 
-int calendar_spec_to_string(const CalendarSpec *spec, char **p);
-int calendar_spec_from_string(const char *p, CalendarSpec **spec);
+int calendar_spec_to_string(const CalendarSpec *spec, char **ret);
+int calendar_spec_from_string(const char *p, CalendarSpec **ret);
 
 int calendar_spec_next_usec(const CalendarSpec *spec, usec_t usec, usec_t *next);
 

@@ -1,18 +1,25 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "cryptenroll-list.h"
+#include "sd-json.h"
+
+#include "alloc-util.h"
 #include "cryptenroll.h"
+#include "cryptenroll-list.h"
+#include "cryptsetup-util.h"
 #include "format-table.h"
+#include "json-util.h"
+#include "log.h"
 #include "parse-util.h"
 
-int list_enrolled(struct crypt_device *cd) {
+struct keyslot_metadata {
+        int slot;
+        const char *type;
+};
 
-        struct keyslot_metadata {
-                int slot;
-                const char *type;
-        } *keyslot_metadata = NULL;
-        size_t n_keyslot_metadata = 0, n_keyslot_metadata_allocated = 0;
+int list_enrolled(struct crypt_device *cd) {
+        _cleanup_free_ struct keyslot_metadata *keyslot_metadata = NULL;
         _cleanup_(table_unrefp) Table *t = NULL;
+        size_t n_keyslot_metadata = 0;
         int slot_max, r;
         TableCell *cell;
 
@@ -27,7 +34,7 @@ int list_enrolled(struct crypt_device *cd) {
                 if (!IN_SET(status, CRYPT_SLOT_ACTIVE, CRYPT_SLOT_ACTIVE_LAST))
                         continue;
 
-                if (!GREEDY_REALLOC(keyslot_metadata, n_keyslot_metadata_allocated, n_keyslot_metadata+1))
+                if (!GREEDY_REALLOC(keyslot_metadata, n_keyslot_metadata+1))
                         return log_oom();
 
                 keyslot_metadata[n_keyslot_metadata++] = (struct keyslot_metadata) {
@@ -37,10 +44,10 @@ int list_enrolled(struct crypt_device *cd) {
 
         /* Second step, enumerate through all tokens, and update the slot table, indicating what kind of
          * token they are assigned to */
-        for (int token = 0; token < LUKS2_TOKENS_MAX; token++) {
-                _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+        for (int token = 0; token < sym_crypt_token_max(CRYPT_LUKS2); token++) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
                 const char *type;
-                JsonVariant *w, *z;
+                sd_json_variant *w, *z;
                 EnrollType et;
 
                 r = cryptsetup_get_token_as_json(cd, token, NULL, &v);
@@ -51,20 +58,20 @@ int list_enrolled(struct crypt_device *cd) {
                         continue;
                 }
 
-                w = json_variant_by_key(v, "type");
-                if (!w || !json_variant_is_string(w)) {
+                w = sd_json_variant_by_key(v, "type");
+                if (!w || !sd_json_variant_is_string(w)) {
                         log_warning("Token JSON data lacks type field, ignoring.");
                         continue;
                 }
 
-                et = luks2_token_type_from_string(json_variant_string(w));
+                et = luks2_token_type_from_string(sd_json_variant_string(w));
                 if (et < 0)
                         type = "other";
                 else
                         type = enroll_type_to_string(et);
 
-                w = json_variant_by_key(v, "keyslots");
-                if (!w || !json_variant_is_array(w)) {
+                w = sd_json_variant_by_key(v, "keyslots");
+                if (!w || !sd_json_variant_is_array(w)) {
                         log_warning("Token JSON data lacks keyslots field, ignoring.");
                         continue;
                 }
@@ -72,14 +79,14 @@ int list_enrolled(struct crypt_device *cd) {
                 JSON_VARIANT_ARRAY_FOREACH(z, w) {
                         unsigned u;
 
-                        if (!json_variant_is_string(z)) {
+                        if (!sd_json_variant_is_string(z)) {
                                 log_warning("Token JSON data's keyslot field is not an array of strings, ignoring.");
                                 continue;
                         }
 
-                        r = safe_atou(json_variant_string(z), &u);
+                        r = safe_atou(sd_json_variant_string(z), &u);
                         if (r < 0) {
-                                log_warning_errno(r, "Token JSON data's keyslot filed is not an integer formatted as string, ignoring.");
+                                log_warning_errno(r, "Token JSON data's keyslot field is not an integer formatted as string, ignoring.");
                                 continue;
                         }
 
@@ -113,7 +120,7 @@ int list_enrolled(struct crypt_device *cd) {
                         return table_log_add_error(r);
         }
 
-        if (table_get_rows(t) <= 1) {
+        if (table_isempty(t)) {
                 log_info("No slots found.");
                 return 0;
         }

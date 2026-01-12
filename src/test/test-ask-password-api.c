@@ -4,23 +4,26 @@
 #include "strv.h"
 #include "tests.h"
 
-static void test_ask_password(void) {
-        int r;
+TEST(ask_password) {
         _cleanup_strv_free_ char **ret = NULL;
+        int r;
 
-        r = ask_password_tty(-1, "hello?", "da key", 0, ASK_PASSWORD_CONSOLE_COLOR, NULL, &ret);
+        static const AskPasswordRequest req = {
+                .tty_fd = -EBADF,
+                .message = "hello?",
+                .keyring = "da key",
+                .until = USEC_INFINITY,
+                .hup_fd = -EBADF,
+        };
+
+        r = ask_password_tty(&req, /* flags= */ ASK_PASSWORD_CONSOLE_COLOR, &ret);
         if (r == -ECANCELED)
-                assert_se(ret == NULL);
+                ASSERT_NULL(ret);
         else {
-                assert_se(r >= 0);
+                ASSERT_OK(r);
                 assert_se(strv_length(ret) == 1);
                 log_info("Got \"%s\"", *ret);
         }
 }
 
-int main(int argc, char **argv) {
-        test_setup_logging(LOG_DEBUG);
-
-        test_ask_password();
-        return EXIT_SUCCESS;
-}
+DEFINE_TEST_MAIN(LOG_DEBUG);

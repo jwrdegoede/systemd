@@ -1,28 +1,62 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "locale-util.h"
+#include <stdio.h>
+
+#include "alloc-util.h"
+#include "ansi-color.h"
+#include "bus-unit-util.h"
+#include "glyph-util.h"
+#include "log.h"
+#include "pager.h"
 #include "sort-util.h"
 #include "special.h"
+#include "string-util.h"
+#include "strv.h"
+#include "systemctl.h"
 #include "systemctl-list-dependencies.h"
 #include "systemctl-util.h"
-#include "systemctl.h"
 #include "terminal-util.h"
+#include "unit-def.h"
+#include "unit-name.h"
 
-static int list_dependencies_print(const char *name, int level, unsigned branches, bool last) {
+static int list_dependencies_print(const char *name, UnitActiveState state, int level, unsigned branches, bool last) {
         _cleanup_free_ char *n = NULL;
         size_t max_len = MAX(columns(),20u);
         size_t len = 0;
-        int i;
+
+        if (arg_plain || state == _UNIT_ACTIVE_STATE_INVALID)
+                printf("  ");
+        else {
+                const char *on;
+
+                switch (state) {
+                case UNIT_ACTIVE:
+                case UNIT_RELOADING:
+                case UNIT_REFRESHING:
+                case UNIT_ACTIVATING:
+                        on = ansi_highlight_green();
+                        break;
+
+                case UNIT_INACTIVE:
+                case UNIT_DEACTIVATING:
+                        on = ansi_normal();
+                        break;
+
+                default:
+                        on = ansi_highlight_red();
+                }
+
+                printf("%s%s%s ", on, glyph(unit_active_state_to_glyph(state)), ansi_normal());
+        }
 
         if (!arg_plain) {
-
-                for (i = level - 1; i >= 0; i--) {
+                for (int i = level - 1; i >= 0; i--) {
                         len += 2;
                         if (len > max_len - 3 && !arg_full) {
                                 printf("%s...\n",max_len % 2 ? "" : " ");
                                 return 0;
                         }
-                        printf("%s", special_glyph(branches & (1 << i) ? SPECIAL_GLYPH_TREE_VERTICAL : SPECIAL_GLYPH_TREE_SPACE));
+                        printf("%s", glyph(branches & (1 << i) ? GLYPH_TREE_VERTICAL : GLYPH_TREE_SPACE));
                 }
                 len += 2;
 
@@ -31,7 +65,7 @@ static int list_dependencies_print(const char *name, int level, unsigned branche
                         return 0;
                 }
 
-                printf("%s", special_glyph(last ? SPECIAL_GLYPH_TREE_RIGHT : SPECIAL_GLYPH_TREE_BRANCH));
+                printf("%s", glyph(last ? GLYPH_TREE_RIGHT : GLYPH_TREE_BRANCH));
         }
 
         if (arg_full) {
@@ -64,8 +98,8 @@ static int list_dependencies_one(
                 unsigned branches) {
 
         _cleanup_strv_free_ char **deps = NULL;
-        char **c;
         int r;
+        bool circular = false;
 
         assert(bus);
         assert(name);
@@ -82,45 +116,35 @@ static int list_dependencies_one(
         typesafe_qsort(deps, strv_length(deps), list_dependencies_compare);
 
         STRV_FOREACH(c, deps) {
+                _cleanup_free_ char *load_state = NULL, *sub_state = NULL;
+                UnitActiveState active_state;
+
                 if (strv_contains(*units, *c)) {
-                        if (!arg_plain) {
-                                printf("  ");
-                                r = list_dependencies_print("...", level + 1, (branches << 1) | (c[1] == NULL ? 0 : 1), 1);
-                                if (r < 0)
-                                        return r;
-                        }
+                        circular = true;
                         continue;
                 }
 
-                if (arg_plain)
-                        printf("  ");
-                else {
-                        UnitActiveState active_state = _UNIT_ACTIVE_STATE_INVALID;
-                        const char *on;
+                if (arg_types && !strv_contains(arg_types, unit_type_suffix(*c)))
+                        continue;
 
-                        (void) get_state_one_unit(bus, *c, &active_state);
+                r = get_state_one_unit(bus, *c, &active_state);
+                if (r < 0)
+                        return r;
 
-                        switch (active_state) {
-                        case UNIT_ACTIVE:
-                        case UNIT_RELOADING:
-                        case UNIT_ACTIVATING:
-                                on = ansi_highlight_green();
-                                break;
+                if (arg_states) {
+                        r = unit_load_state(bus, *c, &load_state);
+                        if (r < 0)
+                                return r;
 
-                        case UNIT_INACTIVE:
-                        case UNIT_DEACTIVATING:
-                                on = ansi_normal();
-                                break;
+                        r = get_sub_state_one_unit(bus, *c, &sub_state);
+                        if (r < 0)
+                                return r;
 
-                        default:
-                                on = ansi_highlight_red();
-                                break;
-                        }
-
-                        printf("%s%s%s ", on, special_glyph(SPECIAL_GLYPH_BLACK_CIRCLE), ansi_normal());
+                        if (!strv_overlap(arg_states, STRV_MAKE(unit_active_state_to_string(active_state), load_state, sub_state)))
+                                continue;
                 }
 
-                r = list_dependencies_print(*c, level, branches, c[1] == NULL);
+                r = list_dependencies_print(*c, active_state, level, branches, /* last= */ c[1] == NULL && !circular);
                 if (r < 0)
                         return r;
 
@@ -131,34 +155,43 @@ static int list_dependencies_one(
                 }
         }
 
+        if (circular && !arg_plain) {
+                r = list_dependencies_print("...", _UNIT_ACTIVE_STATE_INVALID, level, branches, /* last= */ true);
+                if (r < 0)
+                        return r;
+        }
+
         if (!arg_plain)
                 strv_remove(*units, name);
 
         return 0;
 }
 
-int list_dependencies(int argc, char *argv[], void *userdata) {
+int verb_list_dependencies(int argc, char *argv[], void *userdata) {
         _cleanup_strv_free_ char **units = NULL, **done = NULL;
-        char **u, **patterns;
+        char **patterns;
         sd_bus *bus;
         int r;
+
+        /* We won't be able to preserve the tree structure if --type= or --state= is used */
+        arg_plain = arg_plain || arg_types || arg_states;
 
         r = acquire_bus(BUS_MANAGER, &bus);
         if (r < 0)
                 return r;
 
         patterns = strv_skip(argv, 1);
-        if (strv_isempty(patterns)) {
-                units = strv_new(SPECIAL_DEFAULT_TARGET);
-                if (!units)
-                        return log_oom();
-        } else {
+        if (patterns) {
                 r = expand_unit_names(bus, patterns, NULL, &units, NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to expand names: %m");
+        } else {
+                units = strv_new(SPECIAL_DEFAULT_TARGET);
+                if (!units)
+                        return log_oom();
         }
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         STRV_FOREACH(u, units) {
                 if (u != units)

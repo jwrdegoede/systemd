@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <sd-bus.h>
+#include "sd-bus-protocol.h"
 
-#include "user-record.h"
+#include "homed-forward.h"
 
 typedef enum OperationType {
         OPERATION_ACQUIRE,           /* enqueued on AcquireHome() */
@@ -14,7 +14,7 @@ typedef enum OperationType {
         OPERATION_DEACTIVATE_FORCE,  /* enqueued on hard $HOME unplug */
         OPERATION_IMMEDIATE,         /* this is never enqueued, it's just a marker we immediately started executing an operation without enqueuing anything first. */
         _OPERATION_MAX,
-        _OPERATION_INVALID = -1,
+        _OPERATION_INVALID = -EINVAL,
 } OperationType;
 
 /* Encapsulates an operation on one or more home directories. This has two uses:
@@ -39,6 +39,7 @@ typedef struct Operation {
         sd_bus_message *message;
 
         UserRecord *secret;
+        uint64_t call_flags; /* flags passed into UpdateEx() or CreateHomeEx() */
         int send_fd;   /* pipe fd for AcquireHome() which is taken already when we start the operation */
 
         int result;    /* < 0 if not completed yet, == 0 on failure, > 0 on success */
@@ -47,8 +48,7 @@ typedef struct Operation {
 } Operation;
 
 Operation *operation_new(OperationType type, sd_bus_message *m);
-Operation *operation_ref(Operation *operation);
-Operation *operation_unref(Operation *operation);
+DECLARE_TRIVIAL_REF_UNREF_FUNC(Operation, operation);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Operation*, operation_unref);
 

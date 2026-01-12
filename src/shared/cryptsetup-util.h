@@ -1,58 +1,75 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "json.h"
-#include "macro.h"
+#include "dlfcn-util.h"
+#include "shared-forward.h"
 
 #if HAVE_LIBCRYPTSETUP
-#include <libcryptsetup.h>
+#include <libcryptsetup.h> /* IWYU pragma: export */
 
-/* These next two are defined in libcryptsetup.h from cryptsetup version 2.3.4 forwards. */
-#ifndef CRYPT_ACTIVATE_NO_READ_WORKQUEUE
-#define CRYPT_ACTIVATE_NO_READ_WORKQUEUE (1 << 24)
+extern DLSYM_PROTOTYPE(crypt_activate_by_passphrase);
+extern DLSYM_PROTOTYPE(crypt_activate_by_signed_key);
+extern DLSYM_PROTOTYPE(crypt_activate_by_volume_key);
+extern DLSYM_PROTOTYPE(crypt_deactivate_by_name);
+extern DLSYM_PROTOTYPE(crypt_format);
+extern DLSYM_PROTOTYPE(crypt_free);
+extern DLSYM_PROTOTYPE(crypt_get_cipher);
+extern DLSYM_PROTOTYPE(crypt_get_cipher_mode);
+extern DLSYM_PROTOTYPE(crypt_get_data_offset);
+extern DLSYM_PROTOTYPE(crypt_get_device_name);
+extern DLSYM_PROTOTYPE(crypt_get_dir);
+extern DLSYM_PROTOTYPE(crypt_get_type);
+extern DLSYM_PROTOTYPE(crypt_get_uuid);
+extern DLSYM_PROTOTYPE(crypt_get_verity_info);
+extern DLSYM_PROTOTYPE(crypt_get_volume_key_size);
+extern DLSYM_PROTOTYPE(crypt_header_restore);
+extern DLSYM_PROTOTYPE(crypt_init);
+extern DLSYM_PROTOTYPE(crypt_init_by_name);
+extern DLSYM_PROTOTYPE(crypt_keyslot_add_by_volume_key);
+extern DLSYM_PROTOTYPE(crypt_keyslot_destroy);
+extern DLSYM_PROTOTYPE(crypt_keyslot_max);
+extern DLSYM_PROTOTYPE(crypt_load);
+extern DLSYM_PROTOTYPE(crypt_metadata_locking);
+extern DLSYM_PROTOTYPE(crypt_reencrypt_init_by_passphrase);
+extern DLSYM_PROTOTYPE(crypt_reencrypt_run);
+extern DLSYM_PROTOTYPE(crypt_resize);
+extern DLSYM_PROTOTYPE(crypt_resume_by_volume_key);
+extern DLSYM_PROTOTYPE(crypt_set_data_device);
+extern DLSYM_PROTOTYPE(crypt_set_data_offset);
+extern DLSYM_PROTOTYPE(crypt_set_debug_level);
+extern DLSYM_PROTOTYPE(crypt_set_log_callback);
+extern DLSYM_PROTOTYPE(crypt_set_metadata_size);
+extern DLSYM_PROTOTYPE(crypt_set_pbkdf_type);
+extern DLSYM_PROTOTYPE(crypt_suspend);
+extern DLSYM_PROTOTYPE(crypt_token_json_get);
+extern DLSYM_PROTOTYPE(crypt_token_json_set);
+extern DLSYM_PROTOTYPE(crypt_token_max);
+#if HAVE_CRYPT_TOKEN_SET_EXTERNAL_PATH
+extern DLSYM_PROTOTYPE(crypt_token_set_external_path);
 #endif
-#ifndef CRYPT_ACTIVATE_NO_WRITE_WORKQUEUE
-#define CRYPT_ACTIVATE_NO_WRITE_WORKQUEUE (1 << 25)
-#endif
+extern DLSYM_PROTOTYPE(crypt_token_status);
+extern DLSYM_PROTOTYPE(crypt_volume_key_get);
+extern DLSYM_PROTOTYPE(crypt_volume_key_keyring);
+extern DLSYM_PROTOTYPE(crypt_wipe);
+extern DLSYM_PROTOTYPE(crypt_get_integrity_info);
 
-extern int (*sym_crypt_activate_by_passphrase)(struct crypt_device *cd, const char *name, int keyslot, const char *passphrase, size_t passphrase_size, uint32_t flags);
-#if HAVE_CRYPT_ACTIVATE_BY_SIGNED_KEY
-extern int (*sym_crypt_activate_by_signed_key)(struct crypt_device *cd, const char *name, const char *volume_key, size_t volume_key_size, const char *signature, size_t signature_size, uint32_t flags);
-#endif
-extern int (*sym_crypt_activate_by_volume_key)(struct crypt_device *cd, const char *name, const char *volume_key, size_t volume_key_size, uint32_t flags);
-extern int (*sym_crypt_deactivate_by_name)(struct crypt_device *cd, const char *name, uint32_t flags);
-extern int (*sym_crypt_format)(struct crypt_device *cd, const char *type, const char *cipher, const char *cipher_mode, const char *uuid, const char *volume_key, size_t volume_key_size, void *params);
-extern void (*sym_crypt_free)(struct crypt_device *cd);
-extern const char *(*sym_crypt_get_dir)(void);
-extern int (*sym_crypt_get_verity_info)(struct crypt_device *cd, struct crypt_params_verity *vp);
-extern int (*sym_crypt_init)(struct crypt_device **cd, const char *device);
-extern int (*sym_crypt_init_by_name)(struct crypt_device **cd, const char *name);
-extern int (*sym_crypt_keyslot_add_by_volume_key)(struct crypt_device *cd, int keyslot, const char *volume_key, size_t volume_key_size, const char *passphrase, size_t passphrase_size);
-extern int (*sym_crypt_load)(struct crypt_device *cd, const char *requested_type, void *params);
-extern int (*sym_crypt_resize)(struct crypt_device *cd, const char *name, uint64_t new_size);
-extern int (*sym_crypt_set_data_device)(struct crypt_device *cd, const char *device);
-extern void (*sym_crypt_set_debug_level)(int level);
-extern void (*sym_crypt_set_log_callback)(struct crypt_device *cd, void (*log)(int level, const char *msg, void *usrptr), void *usrptr);
-extern int (*sym_crypt_set_pbkdf_type)(struct crypt_device *cd, const struct crypt_pbkdf_type *pbkdf);
-extern int (*sym_crypt_token_json_get)(struct crypt_device *cd, int token, const char **json);
-extern int (*sym_crypt_token_json_set)(struct crypt_device *cd, int token, const char *json);
-extern int (*sym_crypt_volume_key_get)(struct crypt_device *cd, int keyslot, char *volume_key, size_t *volume_key_size, const char *passphrase, size_t passphrase_size);
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(struct crypt_device *, crypt_free, NULL);
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(struct crypt_device *, sym_crypt_free, NULL);
 
-int dlopen_cryptsetup(void);
-
-DEFINE_TRIVIAL_CLEANUP_FUNC(struct crypt_device *, crypt_free);
-DEFINE_TRIVIAL_CLEANUP_FUNC(struct crypt_device *, sym_crypt_free);
+/* Be careful, this works with dlopen_cryptsetup(), that is, it calls sym_crypt_free() instead of crypt_free(). */
+#define crypt_free_and_replace(a, b)                    \
+        free_and_replace_full(a, b, sym_crypt_free)
 
 void cryptsetup_enable_logging(struct crypt_device *cd);
 
 int cryptsetup_set_minimal_pbkdf(struct crypt_device *cd);
 
-int cryptsetup_get_token_as_json(struct crypt_device *cd, int idx, const char *verify_type, JsonVariant **ret);
-int cryptsetup_get_keyslot_from_token(JsonVariant *v);
-int cryptsetup_add_token_json(struct crypt_device *cd, JsonVariant *v);
-
-/* Stolen from cryptsetup's sources. We use to iterate through all tokens defined for a volume. Ideally, we'd
- * be able to query this via some API, but there appears to be none currently in libcryptsetup. */
-#define LUKS2_TOKENS_MAX 32
-
+int cryptsetup_get_token_as_json(struct crypt_device *cd, int idx, const char *verify_type, sd_json_variant **ret);
+int cryptsetup_add_token_json(struct crypt_device *cd, sd_json_variant *v);
 #endif
+
+int dlopen_cryptsetup(void);
+
+int cryptsetup_get_keyslot_from_token(sd_json_variant *v);
+
+const char* mangle_none(const char *s);

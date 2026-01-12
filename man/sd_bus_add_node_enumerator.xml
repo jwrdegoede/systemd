@@ -1,6 +1,6 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_bus_add_node_enumerator"
@@ -58,8 +58,9 @@
 
     <para><parameter>callback</parameter> is called with the path and userdata pointer registered
     with <function>sd_bus_add_node_enumerator()</function>. When called, it should store all the
-    child object paths of the given path prefix in <parameter>ret_nodes</parameter> and return the
-    number of child objects under the given prefix. If an error occurs, it can either return a
+    child object paths of the given path prefix in <parameter>ret_nodes</parameter> with a NULL
+    terminator item. The callback should return a non-negative value on success.
+    If an error occurs, it can either return a
     negative integer, set <parameter>ret_error</parameter> to a non-empty error or do both. Any
     errors returned by the callback are encoded as D-Bus errors and sent back to the caller. Errors
     in <parameter>ret_error</parameter> take priority over negative return values.</para>
@@ -97,8 +98,7 @@
           <term><constant>-EINVAL</constant></term>
 
           <listitem><para>One of the required parameters is <constant>NULL</constant> or
-          <parameter>path</parameter> is not a valid object path.
-          </para></listitem>
+          <parameter>path</parameter> is not a valid object path.</para></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -110,7 +110,7 @@
         <varlistentry>
           <term><constant>-ECHILD</constant></term>
 
-          <listitem><para>The bus was created in a different process.</para></listitem>
+          <listitem><para>The bus was created in a different process, library or module instance.</para></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -125,13 +125,19 @@
   <xi:include href="libsystemd-pkgconfig.xml" />
 
   <refsect1>
+    <title>History</title>
+    <para><function>sd_bus_node_enumerator_t()</function> and
+    <function>sd_bus_add_node_enumerator()</function> were added in version 221.</para>
+  </refsect1>
+
+  <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>busctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_add_fallback_vtable</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_slot_unref</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>busctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_add_fallback_vtable</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_slot_unref</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 </refentry>

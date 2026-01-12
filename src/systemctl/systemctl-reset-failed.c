@@ -1,20 +1,22 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
+
 #include "bus-error.h"
 #include "bus-locator.h"
+#include "log.h"
+#include "strv.h"
 #include "systemctl-reset-failed.h"
 #include "systemctl-trivial-method.h"
 #include "systemctl-util.h"
-#include "systemctl.h"
 
-int reset_failed(int argc, char *argv[], void *userdata) {
+int verb_reset_failed(int argc, char *argv[], void *userdata) {
         _cleanup_strv_free_ char **names = NULL;
         sd_bus *bus;
-        char **name;
         int r, q;
 
         if (argc <= 1) /* Shortcut to trivial_method() if no argument is given */
-                return trivial_method(argc, argv, userdata);
+                return verb_trivial_method(argc, argv, userdata);
 
         r = acquire_bus(BUS_MANAGER, &bus);
         if (r < 0)

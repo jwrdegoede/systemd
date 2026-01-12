@@ -1,6 +1,6 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="nss-systemd" conditional='ENABLE_NSS_SYSTEMD'>
@@ -39,7 +39,7 @@
     <citerefentry><refentrytitle>systemd-homed.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>, or <citerefentry><refentrytitle>systemd-machined.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
 
     <para>This module also ensures that the root and nobody users and groups (i.e. the users/groups with the UIDs/GIDs
-    0 and 65534) remain resolvable at all times, even if they aren't listed in <filename>/etc/passwd</filename> or
+    0 and 65534) remain resolvable at all times, even if they are not listed in <filename>/etc/passwd</filename> or
     <filename>/etc/group</filename>, or if these files are missing.</para>
 
     <para>This module preferably utilizes
@@ -47,11 +47,74 @@
     for resolving users and groups, but also works without the service running.</para>
 
     <para>To activate the NSS module, add <literal>systemd</literal> to the lines starting with
-    <literal>passwd:</literal> and <literal>group:</literal> in <filename>/etc/nsswitch.conf</filename>.</para>
+    <literal>passwd:</literal>, <literal>group:</literal>, <literal>shadow:</literal> and
+    <literal>gshadow:</literal> in <filename>/etc/nsswitch.conf</filename>.</para>
 
-    <para>It is recommended to place <literal>systemd</literal> after the <literal>files</literal> or
-    <literal>compat</literal> entry of the <filename>/etc/nsswitch.conf</filename> lines so that
-    <filename>/etc/passwd</filename> and <filename>/etc/group</filename> based mappings take precedence.</para>
+    <para>It is recommended to place <literal>systemd</literal> after the <literal>files</literal> entry of
+    the <filename>/etc/nsswitch.conf</filename> lines so that <filename>/etc/passwd</filename>,
+    <filename>/etc/group</filename>, <filename>/etc/shadow</filename> and <filename>/etc/gshadow</filename>
+    based mappings take precedence.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>Static Drop-In JSON User/Group Records</title>
+
+    <para>Besides user/group records acquired via the aforementioned Varlink IPC interfaces and the
+    synthesized root and nobody accounts, this module also makes user and group accounts available to the
+    system that are defined in static drop-in files in the <filename>/etc/userdb/</filename>,
+    <filename>/run/userdb/</filename>, <filename>/run/host/userdb/</filename> and
+    <filename>/usr/lib/userdb/</filename> directories.</para>
+
+    <para>This is a simple mechanism to provide static user and group records via JSON drop-in files. Such
+    user records should be defined in the format described by the <ulink
+    url="https://systemd.io/USER_RECORD">JSON User Records</ulink> specification and be placed in one of the
+    aforementioned directories under a file name composed of the user name suffixed with
+    <filename>.user</filename>, with a world-readable access mode. A symlink named after the user record's
+    UID formatted in decimal and suffixed with <filename>.user</filename> pointing to the primary record file
+    should be created as well, in order to allow both lookups by username and by UID. Privileged user record
+    data (e.g. hashed UNIX passwords) may optionally be provided as well, in a pair of separate companion
+    files with the <filename>.user-privileged</filename> suffix. The data should be stored in a regular file
+    named after the user name, suffixed with <filename>.user-privileged</filename>, and a symlink pointing to
+    it, named after the used numeric UID formatted in decimal with the same suffix. These companion files
+    should not be readable to anyone but root. Example:</para>
+
+    <programlisting>-rw-r--r--. 1 root root  723 May 10 foobar.user
+-rw-------. 1 root root  123 May 10 foobar.user-privileged
+lrwxrwxrwx. 1 root root   19 May 10 4711.user -> foobar.user
+lrwxrwxrwx. 1 root root   19 May 10 4711.user-privileged -> foobar.user-privileged</programlisting>
+
+    <para>Similarly, group records following the format described in <ulink
+    url="https://systemd.io/GROUP_RECORD">JSON Group Record</ulink> may be defined, using the file suffixes
+    <filename>.group</filename> and <filename>.group-privileged</filename>.</para>
+
+    <para>The primary user/group record files (i.e. those with the <filename>.user</filename> and
+    <filename>.group</filename> suffixes) should not contain the <literal>privileged</literal> section as
+    described in the specifications. The privileged user/group record files (i.e. those with the
+    <filename>.user-privileged</filename> and <filename>.group-privileged</filename> suffixes) should
+    contain this section, exclusively.</para>
+
+    <para>In addition to the two types of user record files and the two types of group record files there's a
+    fifth type of file that may be placed in the searched directories: files that indicate membership of
+    users in groups. Specifically, for every pair of user/group where the user shall be a member of a group a
+    file named
+    <literal><replaceable>username</replaceable>:<replaceable>groupname</replaceable>.membership</literal>
+    must be created, i.e. the textual UNIX user name, followed by a colon, followed by the textual UNIX group
+    name, suffixed by <literal>.membership</literal>. The contents of these files are currently not read,
+    however it is recommended to create them containing an empty JSON object
+    (i.e. <literal>{}</literal>). The mere existence of these files is enough to affect a user/group
+    membership. If a program provides user and/or group record files in the searched directories, it must
+    always also create such files, both for primary and auxiliary group memberships.</para>
+
+    <para>Note that static user/group records generally do not override conflicting records in
+    <filename>/etc/passwd</filename> or <filename>/etc/group</filename> or other account databases. In fact,
+    before dropping in these files a reasonable level of care should be taken to avoid user/group name and
+    UID/GID conflicts.</para>
+
+    <para>The <filename>systemd-userdb-load-credentials.service</filename> service automatically runs at boot
+    and installs these files from user records passed in via system credentials. See
+    <citerefentry><refentrytitle>userdbctl</refentrytitle><manvolnum>1</manvolnum></citerefentry> and
+    <citerefentry><refentrytitle>systemd.system-credentials</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+    for details.</para>
   </refsect1>
 
   <refsect1>
@@ -61,9 +124,10 @@
     <command>nss-systemd</command> correctly:</para>
 
     <!-- synchronize with other nss-* man pages and factory/etc/nsswitch.conf -->
-    <programlisting>passwd:         compat <command>systemd</command>
-group:          compat [SUCCESS=merge] <command>systemd</command>
-shadow:         compat
+    <programlisting>passwd:         files <command>systemd</command>
+group:          files <command>[SUCCESS=merge] systemd</command>
+shadow:         files <command>systemd</command>
+gshadow:        files <command>systemd</command>
 
 hosts:          mymachines resolve [!UNAVAIL=return] files myhostname dns
 networks:       files
@@ -120,18 +184,20 @@ vu-rawhide-1000  1637 pts/8    -zsh
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>nss-resolve</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>nss-myhostname</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>nss-mymachines</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-userdbd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-homed.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-machined.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>nsswitch.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>getent</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>nss-resolve</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>nss-myhostname</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>nss-mymachines</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-userdbd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-homed.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-machined.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>userdbctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.system-credentials</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>nsswitch.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>getent</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

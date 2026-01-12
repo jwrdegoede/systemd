@@ -1,133 +1,175 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-journal_client_sources = files('''
-        audit-type.c
-        audit-type.h
-        catalog.c
-        catalog.h
-        compress.c
-        compress.h
-        journal-def.h
-        journal-file.c
-        journal-file.h
-        journal-send.c
-        journal-vacuum.c
-        journal-vacuum.h
-        journal-verify.c
-        journal-verify.h
-        lookup3.c
-        lookup3.h
-        mmap-cache.c
-        mmap-cache.h
-        sd-journal.c
-'''.split())
-
-if conf.get('HAVE_GCRYPT') == 1
-        journal_client_sources += files('''
-                journal-authenticate.c
-                journal-authenticate.h
-                fsprg.c
-                fsprg.h
-        '''.split())
-endif
-
-############################################################
-
-audit_type_includes = [config_h,
-                       missing_audit_h,
-                       'linux/audit.h']
-if conf.get('HAVE_AUDIT') == 1
-        audit_type_includes += 'libaudit.h'
-endif
-
-generate_audit_type_list = find_program('generate-audit_type-list.sh')
-audit_type_list_txt = custom_target(
-        'audit_type-list.txt',
-        output : 'audit_type-list.txt',
-        command : [generate_audit_type_list, cpp] + audit_type_includes,
-        capture : true)
-
-audit_type_to_name = custom_target(
-        'audit_type-to-name.h',
-        input : ['audit_type-to-name.awk', audit_type_list_txt],
-        output : 'audit_type-to-name.h',
-        command : [awk, '-f', '@INPUT0@', '@INPUT1@'],
-        capture : true)
-
-journal_client_sources += [audit_type_to_name]
-
-libjournal_client = static_library(
-        'journal-client',
-        journal_client_sources,
-        include_directories : includes,
-        c_args : ['-fvisibility=default'])
-
-############################################################
-
-libjournal_core_sources = files('''
-        journald-audit.c
-        journald-audit.h
-        journald-console.c
-        journald-console.h
-        journald-context.c
-        journald-context.h
-        journald-kmsg.c
-        journald-kmsg.h
-        journald-native.c
-        journald-native.h
-        journald-rate-limit.c
-        journald-rate-limit.h
-        journald-server.c
-        journald-server.h
-        journald-stream.c
-        journald-stream.h
-        journald-syslog.c
-        journald-syslog.h
-        journald-wall.c
-        journald-wall.h
-        journal-internal.h
-'''.split())
-
-systemd_journald_sources = files('''
-        journald.c
-        journald-server.h
-'''.split())
+systemd_journald_sources = files(
+        'journald.c',
+)
+systemd_journald_extract_sources = files(
+        'journald-audit.c',
+        'journald-client.c',
+        'journald-config.c',
+        'journald-console.c',
+        'journald-context.c',
+        'journald-kmsg.c',
+        'journald-manager.c',
+        'journald-native.c',
+        'journald-rate-limit.c',
+        'journald-socket.c',
+        'journald-stream.c',
+        'journald-sync.c',
+        'journald-syslog.c',
+        'journald-varlink.c',
+        'journald-wall.c',
+        # Build fuzz-journald.c as part of systemd-journald so we only compile it once instead of once per
+        # fuzz test.
+        'fuzz-journald-util.c',
+)
 
 journald_gperf_c = custom_target(
-        'journald-gperf.c',
         input : 'journald-gperf.gperf',
         output : 'journald-gperf.c',
         command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
 
-systemd_cat_sources = files('cat.c')
+generated_sources += journald_gperf_c
+systemd_journald_extract_sources += journald_gperf_c
 
-journalctl_sources = files('''
-        journalctl.c
-        pcre2-dlopen.c
-        pcre2-dlopen.h
-'''.split())
+journalctl_sources = files(
+        'journalctl.c',
+        'journalctl-authenticate.c',
+        'journalctl-catalog.c',
+        'journalctl-filter.c',
+        'journalctl-misc.c',
+        'journalctl-show.c',
+        'journalctl-util.c',
+        'journalctl-varlink.c',
+)
 
-if install_sysconfdir
-        install_data('journald.conf',
-                     install_dir : pkgsysconfdir)
+if get_option('link-journalctl-shared')
+        journalctl_link_with = [libshared]
+else
+        journalctl_link_with = [
+                libshared_static,
+                libsystemd_static,
+        ]
 endif
 
+journal_test_template = test_template + {
+        'objects' : ['systemd-journald'],
+}
+
+journal_fuzz_template = fuzz_template + {
+        'objects' : ['systemd-journald'],
+        'dependencies' : libselinux_cflags,
+}
+
+executables += [
+        libexec_template + {
+                'name' : 'systemd-journald',
+                'sources' : systemd_journald_sources,
+                'extract' : systemd_journald_extract_sources,
+                'dependencies' : [
+                        liblz4_cflags,
+                        libselinux_cflags,
+                        libxz_cflags,
+                        libzstd_cflags,
+                        threads,
+                ],
+        },
+        libexec_template + {
+                'name' : 'systemd-bsod',
+                'public' : true,
+                'conditions' : ['HAVE_QRENCODE'],
+                'sources' : files('bsod.c'),
+                'dependencies' : libqrencode,
+        },
+        executable_template + {
+                'name' : 'systemd-cat',
+                'public' : true,
+                'sources' : files('cat.c'),
+                'objects' : ['systemd-journald'],
+                'dependencies' : [threads],
+        },
+        executable_template + {
+                'name' : 'journalctl',
+                'public' : true,
+                'sources' : journalctl_sources,
+                'link_with' : journalctl_link_with,
+                'dependencies' : [
+                        libdl,
+                        liblz4_cflags,
+                        libxz_cflags,
+                        libzstd_cflags,
+                        threads,
+                ],
+        },
+        journal_test_template + {
+                'sources' : files('test-journald-config.c'),
+                'dependencies' : [
+                        liblz4_cflags,
+                        libselinux_cflags,
+                        libxz_cflags,
+                ],
+        },
+        journal_test_template + {
+                'sources' : files('test-journald-rate-limit.c'),
+                'dependencies' : [
+                        liblz4_cflags,
+                        libselinux_cflags,
+                        libxz_cflags,
+                ],
+        },
+        journal_test_template + {
+                'sources' : files('test-journald-syslog.c'),
+                'dependencies' : [
+                        liblz4_cflags,
+                        libselinux_cflags,
+                        libxz_cflags,
+                        threads,
+                ],
+        },
+        journal_test_template + {
+                'sources' : files('test-journald-tables.c'),
+                'dependencies' : [
+                        libselinux_cflags,
+                ],
+        },
+        journal_fuzz_template + {
+                'sources' : files('fuzz-journald-audit.c'),
+        },
+        journal_fuzz_template + {
+                'sources' : files('fuzz-journald-kmsg.c'),
+        },
+        journal_fuzz_template + {
+                'sources' : files('fuzz-journald-native.c'),
+        },
+        journal_fuzz_template + {
+                'sources' : files('fuzz-journald-native-fd.c'),
+        },
+        journal_fuzz_template + {
+                'sources' : files('fuzz-journald-stream.c'),
+        },
+        journal_fuzz_template + {
+                'sources' : files('fuzz-journald-syslog.c'),
+        },
+]
+
+custom_target(
+        input : 'journald.conf.in',
+        output: 'journald.conf',
+        command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
+        install : install_sysconfdir_samples,
+        install_dir : pkgconfigfiledir)
+
 if get_option('create-log-dirs')
-        meson.add_install_script(
-                'sh', '-c',
-                mkdir_p.format('/var/log/journal'))
-        meson.add_install_script(
-                'sh', '-c',
-                '''chown 0:0 $DESTDIR/var/log/journal &&
-                   chmod 755 $DESTDIR/var/log/journal || :''')
+        install_emptydir('/var/log/journal',
+                         install_mode : 'rwxr-xr-x')
         if get_option('adm-group')
                 meson.add_install_script(
-                        'sh', '-c',
+                        sh, '-c',
                         'setfacl -nm g:adm:rx,d:g:adm:rx $DESTDIR/var/log/journal || :')
         endif
         if get_option('wheel-group')
                 meson.add_install_script(
-                        'sh', '-c',
+                        sh, '-c',
                         'setfacl -nm g:wheel:rx,d:g:wheel:rx $DESTDIR/var/log/journal || :')
         endif
 endif

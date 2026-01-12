@@ -2,28 +2,37 @@
 
 #include <unistd.h>
 
+#include "sd-bus.h"
 #include "sd-login.h"
 
 #include "bus-error.h"
 #include "bus-locator.h"
+#include "bus-util.h"
+#include "env-util.h"
+#include "errno-util.h"
+#include "format-util.h"
+#include "log.h"
+#include "login-util.h"
+#include "mountpoint-util.h"
 #include "process-util.h"
+#include "runtime-scope.h"
+#include "string-util.h"
+#include "strv.h"
+#include "systemctl.h"
 #include "systemctl-logind.h"
 #include "systemctl-start-unit.h"
 #include "systemctl-util.h"
-#include "systemctl.h"
 #include "terminal-util.h"
+#include "time-util.h"
 #include "user-util.h"
 
-int logind_set_wall_message(void) {
+static int logind_set_wall_message(sd_bus *bus) {
 #if ENABLE_LOGIND
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        sd_bus *bus;
         _cleanup_free_ char *m = NULL;
         int r;
 
-        r = acquire_bus(BUS_FULL, &bus);
-        if (r < 0)
-                return r;
+        assert(bus);
 
         m = strv_join(arg_wall, " ");
         if (!m)
@@ -43,41 +52,89 @@ int logind_set_wall_message(void) {
 /* Ask systemd-logind, which might grant access to unprivileged users through polkit */
 int logind_reboot(enum action a) {
 #if ENABLE_LOGIND
-        static const struct {
-                const char *method;
-                const char *description;
-        } actions[_ACTION_MAX] = {
-                [ACTION_POWEROFF]               = { "PowerOff",             "power off system"                },
-                [ACTION_REBOOT]                 = { "Reboot",               "reboot system"                   },
-                [ACTION_HALT]                   = { "Halt",                 "halt system"                     },
-                [ACTION_SUSPEND]                = { "Suspend",              "suspend system"                  },
-                [ACTION_HIBERNATE]              = { "Hibernate",            "hibernate system"                },
-                [ACTION_HYBRID_SLEEP]           = { "HybridSleep",          "put system into hybrid sleep"    },
-                [ACTION_SUSPEND_THEN_HIBERNATE] = { "SuspendThenHibernate", "suspend system, hibernate later" },
+        static const char* actions[_ACTION_MAX] = {
+                [ACTION_POWEROFF]               = "PowerOff",
+                [ACTION_REBOOT]                 = "Reboot",
+                [ACTION_KEXEC]                  = "Reboot",
+                [ACTION_SOFT_REBOOT]            = "Reboot",
+                [ACTION_HALT]                   = "Halt",
+                [ACTION_SUSPEND]                = "Suspend",
+                [ACTION_HIBERNATE]              = "Hibernate",
+                [ACTION_HYBRID_SLEEP]           = "HybridSleep",
+                [ACTION_SUSPEND_THEN_HIBERNATE] = "SuspendThenHibernate",
+                [ACTION_SLEEP]                  = "Sleep",
         };
 
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        uint64_t flags = 0;
         sd_bus *bus;
         int r;
 
-        if (a < 0 || a >= _ACTION_MAX || !actions[a].method)
+        assert(a >= 0);
+        assert(a < _ACTION_MAX);
+
+        if (!actions[a])
                 return -EINVAL;
 
-        r = acquire_bus(BUS_FULL, &bus);
+        r = acquire_bus_full(BUS_FULL, /* graceful= */ true, &bus);
         if (r < 0)
                 return r;
 
         polkit_agent_open_maybe();
-        (void) logind_set_wall_message();
+        (void) logind_set_wall_message(bus);
 
-        log_debug("%s org.freedesktop.login1.Manager %s dbus call.", arg_dry_run ? "Would execute" : "Executing", actions[a].method);
+        const char *method_with_flags = a == ACTION_SLEEP ? actions[a] : strjoina(actions[a], "WithFlags");
+
+        log_debug("%s org.freedesktop.login1.Manager %s dbus call.",
+                  arg_dry_run ? "Would execute" : "Executing", method_with_flags);
 
         if (arg_dry_run)
                 return 0;
 
-        r = bus_call_method(bus, bus_login_mgr, actions[a].method, &error, NULL, "b", arg_ask_password);
+        SET_FLAG(flags, SD_LOGIND_ROOT_CHECK_INHIBITORS, arg_check_inhibitors > 0);
+        SET_FLAG(flags, SD_LOGIND_SKIP_INHIBITORS, arg_check_inhibitors == 0);
+        SET_FLAG(flags,
+                 SD_LOGIND_REBOOT_VIA_KEXEC,
+                 a == ACTION_KEXEC || (a == ACTION_REBOOT && getenv_bool("SYSTEMCTL_SKIP_AUTO_KEXEC") <= 0));
+        /* Try to soft-reboot if /run/nextroot/ is a valid OS tree, but only if it's also a mount point.
+         * Otherwise, if people store new rootfs directly on /run/ tmpfs, 'systemctl reboot' would always
+         * soft-reboot, as /run/nextroot/ can never go away. */
+        SET_FLAG(flags,
+                 SD_LOGIND_SOFT_REBOOT_IF_NEXTROOT_SET_UP,
+                 a == ACTION_REBOOT && getenv_bool("SYSTEMCTL_SKIP_AUTO_SOFT_REBOOT") <= 0 && path_is_mount_point("/run/nextroot") > 0);
+        SET_FLAG(flags, SD_LOGIND_SOFT_REBOOT, a == ACTION_SOFT_REBOOT);
+
+        r = bus_call_method(bus, bus_login_mgr, method_with_flags, &error, NULL, "t", flags);
+        if (r < 0 && FLAGS_SET(flags, SD_LOGIND_SKIP_INHIBITORS) &&
+                        sd_bus_error_has_name(&error, SD_BUS_ERROR_INVALID_ARGS)) {
+                sd_bus_error_free(&error);
+                flags &= ~SD_LOGIND_SKIP_INHIBITORS;
+                r = bus_call_method(bus, bus_login_mgr, method_with_flags, &error, NULL, "t", flags);
+        }
+        if (r < 0 && FLAGS_SET(flags, SD_LOGIND_SOFT_REBOOT_IF_NEXTROOT_SET_UP) &&
+                        sd_bus_error_has_name(&error, SD_BUS_ERROR_INVALID_ARGS)) {
+                sd_bus_error_free(&error);
+                flags &= ~SD_LOGIND_SOFT_REBOOT_IF_NEXTROOT_SET_UP;
+                r = bus_call_method(bus, bus_login_mgr, method_with_flags, &error, NULL, "t", flags);
+        }
+        if (r >= 0)
+                return 0;
+        if (geteuid() == 0 && sd_bus_error_has_name(&error, SD_BUS_ERROR_INTERACTIVE_AUTHORIZATION_REQUIRED))
+                return log_error_errno(r,
+                                       "The current polkit policy does not allow root to ignore inhibitors without authentication in order to %s.\n"
+                                       "To allow this action, a new polkit rule is needed.\n"
+                                       "See " POLKIT_RULES_DIR "/10-systemd-logind-root-ignore-inhibitors.rules.example.",
+                                       action_table[a].verb);
+        if (!sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_METHOD) || a == ACTION_SLEEP)
+                return log_error_errno(r, "Call to %s failed: %s", actions[a], bus_error_message(&error, r));
+
+        /* Fall back to original methods in case there is an older version of systemd-logind */
+        log_debug("Method %s not available: %s. Falling back to %s", method_with_flags, bus_error_message(&error, r), actions[a]);
+        sd_bus_error_free(&error);
+
+        r = bus_call_method(bus, bus_login_mgr, actions[a], &error, NULL, "b", arg_ask_password);
         if (r < 0)
-                return log_error_errno(r, "Failed to %s via logind: %s", actions[a].description, bus_error_message(&error, r));
+                return log_error_errno(r, "Call to %s failed: %s", actions[a], bus_error_message(&error, r));
 
         return 0;
 #else
@@ -93,25 +150,27 @@ int logind_check_inhibitors(enum action a) {
         uint32_t uid, pid;
         sd_bus *bus;
         unsigned c = 0;
-        char **s;
         int r;
 
-        if (arg_ignore_inhibitors || arg_force > 0)
+        assert(a >= 0);
+        assert(a < _ACTION_MAX);
+
+        if (arg_check_inhibitors == 0 || arg_force > 0)
                 return 0;
 
         if (arg_when > 0)
                 return 0;
 
-        if (geteuid() == 0)
-                return 0;
-
-        if (!on_tty())
+        if (arg_check_inhibitors < 0 && !on_tty())
                 return 0;
 
         if (arg_transport != BUS_TRANSPORT_LOCAL)
                 return 0;
 
-        r = acquire_bus(BUS_FULL, &bus);
+        r = acquire_bus_full(BUS_FULL, /* graceful= */ true, &bus);
+        if ((ERRNO_IS_NEG_DISCONNECT(r) || r == -ENOENT) && geteuid() == 0)
+                return 0; /* When D-Bus is not running (ECONNREFUSED) or D-Bus socket is not created (ENOENT),
+                           * allow root to force a shutdown. E.g. when running at the emergency console. */
         if (r < 0)
                 return r;
 
@@ -128,7 +187,10 @@ int logind_check_inhibitors(enum action a) {
                 _cleanup_free_ char *comm = NULL, *user = NULL;
                 _cleanup_strv_free_ char **sv = NULL;
 
-                if (!streq(mode, "block"))
+                if (!STR_IN_SET(mode, "block", "block-weak"))
+                        continue;
+
+                if (streq(mode, "block-weak") && (geteuid() == 0 || geteuid() == uid || !on_tty()))
                         continue;
 
                 sv = strv_split(what, ":");
@@ -146,7 +208,7 @@ int logind_check_inhibitors(enum action a) {
                                           ACTION_KEXEC) ? "shutdown" : "sleep"))
                         continue;
 
-                (void) get_process_comm(pid, &comm);
+                (void) pid_get_comm(pid, &comm);
                 user = uid_to_name(uid);
 
                 log_warning("Operation inhibited by \"%s\" (PID "PID_FMT" \"%s\", user %s), reason is \"%s\".",
@@ -160,6 +222,10 @@ int logind_check_inhibitors(enum action a) {
         r = sd_bus_message_exit_container(reply);
         if (r < 0)
                 return bus_log_parse_error(r);
+
+        /* root respects inhibitors since v257 but keeps ignoring sessions by default */
+        if (arg_check_inhibitors < 0 && c == 0 && geteuid() == 0)
+                return 0;
 
         /* Check for current sessions */
         sd_get_sessions(&sessions);
@@ -189,6 +255,7 @@ int logind_check_inhibitors(enum action a) {
 
         return log_error_errno(SYNTHETIC_ERRNO(EPERM),
                                "Please retry operation after closing inhibitors and logging out other users.\n"
+                               "'systemd-inhibit' can be used to list active inhibitors.\n"
                                "Alternatively, ignore inhibitors and users with 'systemctl %s -i'.",
                                action_table[a].verb);
 #else
@@ -271,55 +338,36 @@ int prepare_boot_loader_entry(void) {
 #endif
 }
 
-int logind_schedule_shutdown(void) {
-
+int logind_schedule_shutdown(enum action a) {
 #if ENABLE_LOGIND
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        char date[FORMAT_TIMESTAMP_MAX];
         const char *action;
-        const char *log_action;
         sd_bus *bus;
         int r;
+
+        assert(a >= 0);
+        assert(a < _ACTION_MAX);
 
         r = acquire_bus(BUS_FULL, &bus);
         if (r < 0)
                 return r;
 
-        switch (arg_action) {
-        case ACTION_HALT:
-                action = "halt";
-                log_action = "Shutdown";
-                break;
-        case ACTION_POWEROFF:
-                action = "poweroff";
-                log_action = "Shutdown";
-                break;
-        case ACTION_KEXEC:
-                action = "kexec";
-                log_action = "Reboot via kexec";
-                break;
-        case ACTION_EXIT:
-                action = "exit";
-                log_action = "Shutdown";
-                break;
-        case ACTION_REBOOT:
-        default:
-                action = "reboot";
-                log_action = "Reboot";
-                break;
-        }
+        action = action_table[a].verb;
+        if (!action)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Scheduling not supported for this action.");
 
         if (arg_dry_run)
                 action = strjoina("dry-", action);
 
-        (void) logind_set_wall_message();
+        (void) logind_set_wall_message(bus);
 
         r = bus_call_method(bus, bus_login_mgr, "ScheduleShutdown", &error, NULL, "st", action, arg_when);
         if (r < 0)
-                return log_warning_errno(r, "Failed to call ScheduleShutdown in logind, proceeding with immediate shutdown: %s", bus_error_message(&error, r));
+                return log_warning_errno(r, "Failed to schedule shutdown: %s", bus_error_message(&error, r));
 
         if (!arg_quiet)
-                log_info("%s scheduled for %s, use 'shutdown -c' to cancel.", log_action, format_timestamp_style(date, sizeof(date), arg_when, arg_timestamp_style));
+                logind_show_shutdown();
+
         return 0;
 #else
         return log_error_errno(SYNTHETIC_ERRNO(ENOSYS),
@@ -337,7 +385,7 @@ int logind_cancel_shutdown(void) {
         if (r < 0)
                 return r;
 
-        (void) logind_set_wall_message();
+        (void) logind_set_wall_message(bus);
 
         r = bus_call_method(bus, bus_login_mgr, "CancelScheduledShutdown", &error, NULL, NULL);
         if (r < 0)
@@ -350,13 +398,70 @@ int logind_cancel_shutdown(void) {
 #endif
 }
 
+int logind_show_shutdown(void) {
+#if ENABLE_LOGIND
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        sd_bus *bus;
+        const char *action, *pretty_action;
+        uint64_t elapse;
+        int r;
+
+        r = acquire_bus(BUS_FULL, &bus);
+        if (r < 0)
+                return r;
+
+        r = bus_get_property(bus, bus_login_mgr, "ScheduledShutdown", &error, &reply, "(st)");
+        if (r < 0)
+                return log_error_errno(r, "Failed to query scheduled shutdown: %s", bus_error_message(&error, r));
+
+        r = sd_bus_message_read(reply, "(st)", &action, &elapse);
+        if (r < 0)
+                return r;
+
+        if (isempty(action))
+                return log_full_errno(arg_quiet ? LOG_DEBUG : LOG_ERR, SYNTHETIC_ERRNO(ENODATA), "No scheduled shutdown.");
+
+        if (STR_IN_SET(action, "halt", "poweroff", "exit"))
+                pretty_action = "Shutdown";
+        else if (streq(action, "kexec"))
+                pretty_action = "Reboot via kexec";
+        else if (streq(action, "reboot"))
+                pretty_action = "Reboot";
+        else /* If we don't recognize the action string, we'll show it as-is */
+                pretty_action = action;
+
+        if (IN_SET(arg_action, ACTION_SYSTEMCTL, ACTION_SYSTEMCTL_SHOW_SHUTDOWN))
+                log_info("%s scheduled for %s, use 'systemctl %s --when=cancel' to cancel.",
+                         pretty_action,
+                         FORMAT_TIMESTAMP_STYLE(elapse, arg_timestamp_style),
+                         action);
+        else
+                log_info("%s scheduled for %s, use 'shutdown -c' to cancel.",
+                         pretty_action,
+                         FORMAT_TIMESTAMP_STYLE(elapse, arg_timestamp_style));
+
+        return 0;
+#else
+        return log_error_errno(SYNTHETIC_ERRNO(ENOSYS),
+                               "Not compiled with logind support, cannot show scheduled shutdowns.");
+#endif
+}
+
 int help_boot_loader_entry(void) {
 #if ENABLE_LOGIND
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_strv_free_ char **l = NULL;
         sd_bus *bus;
-        char **i;
         int r;
+
+        /* This is called without checking runtime scope and bus transport like we do in parse_argv().
+         * Loading boot entries is only supported by system scope. Let's gracefully adjust them. */
+        arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
+        if (arg_transport == BUS_TRANSPORT_CAPSULE) {
+                arg_host = NULL;
+                arg_transport = BUS_TRANSPORT_LOCAL;
+        }
 
         r = acquire_bus(BUS_FULL, &bus);
         if (r < 0)

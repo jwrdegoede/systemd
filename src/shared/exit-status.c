@@ -5,9 +5,7 @@
 #include <sysexits.h>
 
 #include "exit-status.h"
-#include "macro.h"
 #include "parse-util.h"
-#include "set.h"
 #include "string-util.h"
 
 const ExitStatusMapping exit_status_mappings[256] = {
@@ -18,8 +16,8 @@ const ExitStatusMapping exit_status_mappings[256] = {
          *   8…63  │ (Currently unmapped)
          *  64…78  │ BSD defined exit codes
          *  79…199 │ (Currently unmapped)
-         * 200…242 │ systemd's private error codes (might be extended to 254 in future development)
-         * 243…254 │ (Currently unmapped, but see above)
+         * 200…244 │ systemd's private error codes (might be extended to 254 in future development)
+         * 245…254 │ (Currently unmapped, but see above)
          *
          *   255   │ EXIT_EXCEPTION (We use this to propagate exit-by-signal events. It's frequently used by others apps (like bash)
          *         │ to indicate exit reason that cannot really be expressed in a single exit status value — such as a propagated
@@ -71,6 +69,9 @@ const ExitStatusMapping exit_status_mappings[256] = {
         [EXIT_CONFIGURATION_DIRECTORY] = { "CONFIGURATION_DIRECTORY", EXIT_STATUS_SYSTEMD },
         [EXIT_NUMA_POLICY] =             { "NUMA_POLICY",             EXIT_STATUS_SYSTEMD },
         [EXIT_CREDENTIALS] =             { "CREDENTIALS",             EXIT_STATUS_SYSTEMD },
+        [EXIT_BPF] =                     { "BPF",                     EXIT_STATUS_SYSTEMD },
+        [EXIT_KSM] =                     { "KSM",                     EXIT_STATUS_SYSTEMD },
+        [EXIT_MEMORY_THP] =              { "MEMORY_THP",              EXIT_STATUS_SYSTEMD },
 
         [EXIT_EXCEPTION] =               { "EXCEPTION",               EXIT_STATUS_SYSTEMD },
 
@@ -143,12 +144,11 @@ bool is_clean_exit(int code, int status, ExitClean clean, const ExitStatusSet *s
                         bitmap_isset(&success_status->status, status));
 
         /* If a daemon does not implement handlers for some of the signals, we do not consider this an
-           unclean shutdown */
+         * unclean shutdown */
         if (code == CLD_KILLED)
-                return
-                        (clean == EXIT_CLEAN_DAEMON && IN_SET(status, SIGHUP, SIGINT, SIGTERM, SIGPIPE)) ||
-                        (success_status &&
-                         bitmap_isset(&success_status->signal, status));
+                return (clean == EXIT_CLEAN_DAEMON && IN_SET(status, SIGHUP, SIGINT, SIGTERM, SIGPIPE)) ||
+                       (success_status &&
+                        bitmap_isset(&success_status->signal, status));
 
         return false;
 }

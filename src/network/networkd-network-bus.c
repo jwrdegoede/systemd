@@ -1,13 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
+
 #include "alloc-util.h"
+#include "bus-object.h"
 #include "ether-addr-util.h"
 #include "networkd-manager.h"
 #include "networkd-network-bus.h"
-#include "string-util.h"
+#include "set.h"
 #include "strv.h"
 
-static int property_get_ether_addrs(
+static int property_get_hw_addrs(
                 sd_bus *bus,
                 const char *path,
                 const char *interface,
@@ -16,8 +19,7 @@ static int property_get_ether_addrs(
                 void *userdata,
                 sd_bus_error *error) {
 
-        char buf[ETHER_ADDR_TO_STRING_MAX];
-        const struct ether_addr *p;
+        const struct hw_addr_data *p;
         Set *s;
         int r;
 
@@ -32,7 +34,7 @@ static int property_get_ether_addrs(
                 return r;
 
         SET_FOREACH(p, s) {
-                r = sd_bus_message_append(reply, "s", ether_addr_to_string(p, buf));
+                r = sd_bus_message_append(reply, "s", HW_ADDR_TO_STR(p));
                 if (r < 0)
                         return r;
         }
@@ -40,12 +42,12 @@ static int property_get_ether_addrs(
         return sd_bus_message_close_container(reply);
 }
 
-const sd_bus_vtable network_vtable[] = {
+static const sd_bus_vtable network_vtable[] = {
         SD_BUS_VTABLE_START(0),
 
         SD_BUS_PROPERTY("Description", "s", NULL, offsetof(Network, description), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("SourcePath", "s", NULL, offsetof(Network, filename), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("MatchMAC", "as", property_get_ether_addrs, offsetof(Network, match.mac), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("MatchMAC", "as", property_get_hw_addrs, offsetof(Network, match.hw_addr), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("MatchPath", "as", NULL, offsetof(Network, match.path), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("MatchDriver", "as", NULL, offsetof(Network, match.driver), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("MatchType", "as", NULL, offsetof(Network, match.iftype), SD_BUS_VTABLE_PROPERTY_CONST),
@@ -55,28 +57,13 @@ const sd_bus_vtable network_vtable[] = {
 };
 
 static char *network_bus_path(Network *network) {
-        _cleanup_free_ char *name = NULL;
-        char *networkname, *d, *path;
+        char *path;
         int r;
 
         assert(network);
-        assert(network->filename);
+        assert(network->name);
 
-        name = strdup(network->filename);
-        if (!name)
-                return NULL;
-
-        networkname = basename(name);
-
-        d = strrchr(networkname, '.');
-        if (!d)
-                return NULL;
-
-        assert(streq(d, ".network"));
-
-        *d = '\0';
-
-        r = sd_bus_path_encode("/org/freedesktop/network1/network", networkname, &path);
+        r = sd_bus_path_encode("/org/freedesktop/network1/network", network->name, &path);
         if (r < 0)
                 return NULL;
 
@@ -85,13 +72,12 @@ static char *network_bus_path(Network *network) {
 
 int network_node_enumerator(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
         _cleanup_strv_free_ char **l = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Network *network;
         int r;
 
         assert(bus);
         assert(path);
-        assert(m);
         assert(nodes);
 
         ORDERED_HASHMAP_FOREACH(network, m->networks) {
@@ -112,7 +98,7 @@ int network_node_enumerator(sd_bus *bus, const char *path, void *userdata, char 
 }
 
 int network_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Network *network;
         _cleanup_free_ char *name = NULL;
         int r;
@@ -120,7 +106,6 @@ int network_object_find(sd_bus *bus, const char *path, const char *interface, vo
         assert(bus);
         assert(path);
         assert(interface);
-        assert(m);
         assert(found);
 
         r = sd_bus_path_decode(path, "/org/freedesktop/network1/network", &name);
@@ -135,3 +120,10 @@ int network_object_find(sd_bus *bus, const char *path, const char *interface, vo
 
         return 1;
 }
+
+const BusObjectImplementation network_object = {
+        "/org/freedesktop/network1/network",
+        "org.freedesktop.network1.Network",
+        .fallback_vtables = BUS_FALLBACK_VTABLES({network_vtable, network_object_find}),
+        .node_enumerator = network_node_enumerator,
+};

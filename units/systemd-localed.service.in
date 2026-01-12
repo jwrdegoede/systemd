@@ -15,9 +15,10 @@ Documentation=man:vconsole.conf(5)
 Documentation=man:org.freedesktop.locale1(5)
 
 [Service]
+Type=notify
 BusName=org.freedesktop.locale1
 CapabilityBoundingSet=
-ExecStart=@rootlibexecdir@/systemd-localed
+ExecStart={{LIBEXECDIR}}/systemd-localed
 IPAddressDeny=any
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
@@ -34,6 +35,9 @@ ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectSystem=strict
 ReadWritePaths=/etc
+{% if HAVE_LOCALEGEN %}
+ReadWritePaths=/usr/lib/locale
+{% endif %}
 RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes
@@ -41,4 +45,4 @@ RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 SystemCallErrorNumber=EPERM
 SystemCallFilter=@system-service
-@SERVICE_WATCHDOG@
+{{SERVICE_WATCHDOG}}

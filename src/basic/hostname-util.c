@@ -1,82 +1,48 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <limits.h>
-#include <stdio.h>
-#include <sys/utsname.h>
-#include <unistd.h>
+#include <stdlib.h>
 
 #include "alloc-util.h"
+#include "env-file.h"
 #include "hostname-util.h"
+#include "log.h"
+#include "os-util.h"
 #include "string-util.h"
 #include "strv.h"
+#include "user-util.h"
 
-char* gethostname_malloc(void) {
-        struct utsname u;
-        const char *s;
+char* get_default_hostname_raw(void) {
+        int r;
 
-        /* This call tries to return something useful, either the actual hostname
-         * or it makes something up. The only reason it might fail is OOM.
-         * It might even return "localhost" if that's set. */
+        /* Returns the default hostname, and leaves any ??? in place. */
 
-        assert_se(uname(&u) >= 0);
+        const char *e = secure_getenv("SYSTEMD_DEFAULT_HOSTNAME");
+        if (e) {
+                if (hostname_is_valid(e, VALID_HOSTNAME_QUESTION_MARK))
+                        return strdup(e);
 
-        s = u.nodename;
-        if (isempty(s) || streq(s, "(none)"))
-                s = FALLBACK_HOSTNAME;
-
-        return strdup(s);
-}
-
-char* gethostname_short_malloc(void) {
-        struct utsname u;
-        const char *s;
-
-        /* Like above, but kills the FQDN part if present. */
-
-        assert_se(uname(&u) >= 0);
-
-        s = u.nodename;
-        if (isempty(s) || streq(s, "(none)") || s[0] == '.') {
-                s = FALLBACK_HOSTNAME;
-                assert(s[0] != '.');
+                log_debug("Invalid hostname in $SYSTEMD_DEFAULT_HOSTNAME, ignoring: %s", e);
         }
 
-        return strndup(s, strcspn(s, "."));
-}
+        _cleanup_free_ char *f = NULL;
+        r = parse_os_release(NULL, "DEFAULT_HOSTNAME", &f);
+        if (r < 0)
+                log_debug_errno(r, "Failed to parse os-release, ignoring: %m");
+        else if (f) {
+                if (hostname_is_valid(f, VALID_HOSTNAME_QUESTION_MARK))
+                        return TAKE_PTR(f);
 
-int gethostname_strict(char **ret) {
-        struct utsname u;
-        char *k;
+                log_debug("Invalid hostname in os-release, ignoring: %s", f);
+        }
 
-        /* This call will rather fail than make up a name. It will not return "localhost" either. */
-
-        assert_se(uname(&u) >= 0);
-
-        if (isempty(u.nodename))
-                return -ENXIO;
-
-        if (streq(u.nodename, "(none)"))
-                return -ENXIO;
-
-        if (is_localhost(u.nodename))
-                return -ENXIO;
-
-        k = strdup(u.nodename);
-        if (!k)
-                return -ENOMEM;
-
-        *ret = k;
-        return 0;
+        return strdup(FALLBACK_HOSTNAME);
 }
 
 bool valid_ldh_char(char c) {
         /* "LDH" → "Letters, digits, hyphens", as per RFC 5890, Section 2.3.1 */
 
-        return
-                (c >= 'a' && c <= 'z') ||
-                (c >= 'A' && c <= 'Z') ||
-                (c >= '0' && c <= '9') ||
+        return ascii_isalpha(c) ||
+                ascii_isdigit(c) ||
                 c == '-';
 }
 
@@ -116,7 +82,7 @@ bool hostname_is_valid(const char *s, ValidHostnameFlags flags) {
                         hyphen = true;
 
                 } else {
-                        if (!valid_ldh_char(*p))
+                        if (!valid_ldh_char(*p) && (*p != '?' || !FLAGS_SET(flags, VALID_HOSTNAME_QUESTION_MARK)))
                                 return false;
 
                         dot = false;
@@ -128,8 +94,8 @@ bool hostname_is_valid(const char *s, ValidHostnameFlags flags) {
         if (hyphen)
                 return false;
 
-        if (p-s > HOST_NAME_MAX) /* Note that HOST_NAME_MAX is 64 on Linux, but DNS allows domain names up to
-                                  * 255 characters */
+        /* Note that host name max is 64 on Linux, but DNS allows domain names up to 255 characters. */
+        if (p - s > (ssize_t) LINUX_HOST_NAME_MAX)
                 return false;
 
         return true;
@@ -141,7 +107,7 @@ char* hostname_cleanup(char *s) {
 
         assert(s);
 
-        for (p = s, d = s, dot = hyphen = true; *p && d - s < HOST_NAME_MAX; p++)
+        for (p = s, d = s, dot = hyphen = true; *p && d - s < (ssize_t) LINUX_HOST_NAME_MAX; p++)
                 if (*p == '.') {
                         if (dot || hyphen)
                                 continue;
@@ -158,7 +124,7 @@ char* hostname_cleanup(char *s) {
                         dot = false;
                         hyphen = true;
 
-                } else if (valid_ldh_char(*p)) {
+                } else if (valid_ldh_char(*p) || *p == '?') {
                         *(d++) = *p;
                         dot = false;
                         hyphen = false;
@@ -189,4 +155,101 @@ bool is_localhost(const char *hostname) {
                 endswith_no_case(hostname, ".localhost.") ||
                 endswith_no_case(hostname, ".localhost.localdomain") ||
                 endswith_no_case(hostname, ".localhost.localdomain.");
+}
+
+const char* etc_hostname(void) {
+        static const char *cached = NULL;
+
+        if (!cached)
+                cached = secure_getenv("SYSTEMD_ETC_HOSTNAME") ?: "/etc/hostname";
+
+        return cached;
+}
+
+const char* etc_machine_info(void) {
+        static const char *cached = NULL;
+
+        if (!cached)
+                cached = secure_getenv("SYSTEMD_ETC_MACHINE_INFO") ?: "/etc/machine-info";
+
+        return cached;
+}
+
+int get_pretty_hostname(char **ret) {
+        _cleanup_free_ char *n = NULL;
+        int r;
+
+        assert(ret);
+
+        r = parse_env_file(NULL, etc_machine_info(), "PRETTY_HOSTNAME", &n);
+        if (r < 0)
+                return r;
+
+        if (isempty(n))
+                return -ENXIO;
+
+        *ret = TAKE_PTR(n);
+        return 0;
+}
+
+int split_user_at_host(const char *s, char **ret_user, char **ret_host) {
+        _cleanup_free_ char *u = NULL, *h = NULL;
+
+        /* Splits a user@host expression (one of those we accept on --machine= and similar). Returns NULL in
+         * each of the two return parameters if that part was left empty. */
+
+        assert(s);
+
+        const char *rhs = strchr(s, '@');
+        if (rhs) {
+                if (ret_user && rhs > s) {
+                        u = strndup(s, rhs - s);
+                        if (!u)
+                                return -ENOMEM;
+                }
+
+                if (ret_host && rhs[1] != 0) {
+                        h = strdup(rhs + 1);
+                        if (!h)
+                                return -ENOMEM;
+                }
+
+        } else {
+                if (isempty(s))
+                        return -EINVAL;
+
+                if (ret_host) {
+                        h = strdup(s);
+                        if (!h)
+                                return -ENOMEM;
+                }
+        }
+
+        if (ret_user)
+                *ret_user = TAKE_PTR(u);
+        if (ret_host)
+                *ret_host = TAKE_PTR(h);
+
+        return !!rhs; /* return > 0 if '@' was specified, 0 otherwise */
+}
+
+int machine_spec_valid(const char *s) {
+        _cleanup_free_ char *u = NULL, *h = NULL;
+        int r;
+
+        assert(s);
+
+        r = split_user_at_host(s, &u, &h);
+        if (r == -EINVAL)
+                return false;
+        if (r < 0)
+                return r;
+
+        if (u && !valid_user_group_name(u, VALID_USER_RELAX | VALID_USER_ALLOW_NUMERIC))
+                return false;
+
+        if (h && !hostname_is_valid(h, VALID_HOSTNAME_DOT_HOST))
+                return false;
+
+        return true;
 }

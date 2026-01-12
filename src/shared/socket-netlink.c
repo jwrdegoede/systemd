@@ -1,174 +1,94 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <arpa/inet.h>
-#include <errno.h>
-#include <net/if.h>
+#include <linux/net_namespace.h>
+#include <linux/unix_diag.h>
 #include <string.h>
+#include <sys/stat.h>
+
+#include "sd-netlink.h"
 
 #include "alloc-util.h"
-#include "errno-util.h"
 #include "extract-word.h"
+#include "fd-util.h"
 #include "log.h"
-#include "memory-util.h"
+#include "namespace-util.h"
+#include "netlink-sock-diag.h"
 #include "netlink-util.h"
 #include "parse-util.h"
+#include "socket-label.h"
 #include "socket-netlink.h"
 #include "socket-util.h"
 #include "string-util.h"
 
-int resolve_ifname(sd_netlink **rtnl, const char *name) {
-        int r;
-
-        /* Like if_nametoindex, but resolves "alternative names" too. */
-
-        assert(name);
-
-        r = if_nametoindex(name);
-        if (r > 0)
-                return r;
-
-        return rtnl_resolve_link_alternative_name(rtnl, name);
-}
-
-int resolve_interface(sd_netlink **rtnl, const char *name) {
-        int r;
-
-        /* Like resolve_ifname, but resolves interface numbers too. */
-
-        assert(name);
-
-        r = parse_ifindex(name);
-        if (r > 0)
-                return r;
-        assert(r < 0);
-
-        return resolve_ifname(rtnl, name);
-}
-
-int resolve_interface_or_warn(sd_netlink **rtnl, const char *name) {
-        int r;
-
-        r = resolve_interface(rtnl, name);
-        if (r < 0)
-                return log_error_errno(r, "Failed to resolve interface \"%s\": %m", name);
-        return r;
-}
-
 int socket_address_parse(SocketAddress *a, const char *s) {
-        _cleanup_free_ char *n = NULL;
-        char *e;
+        uint16_t port;
         int r;
 
         assert(a);
         assert(s);
 
-        if (IN_SET(*s, '/', '@')) {
-                /* AF_UNIX socket */
-                struct sockaddr_un un;
+        r = socket_address_parse_unix(a, s);
+        if (r == -EPROTO)
+                r = socket_address_parse_vsock(a, s);
+        if (r != -EPROTO)
+                return r;
 
-                r = sockaddr_un_set_path(&un, s);
-                if (r < 0)
-                        return r;
-
-                *a = (SocketAddress) {
-                        .sockaddr.un = un,
-                        .size = r,
-                };
-
-        } else if (startswith(s, "vsock:")) {
-                /* AF_VSOCK socket in vsock:cid:port notation */
-                const char *cid_start = s + STRLEN("vsock:");
-                unsigned port, cid;
-
-                e = strchr(cid_start, ':');
-                if (!e)
-                        return -EINVAL;
-
-                r = safe_atou(e+1, &port);
-                if (r < 0)
-                        return r;
-
-                n = strndup(cid_start, e - cid_start);
-                if (!n)
-                        return -ENOMEM;
-
-                if (isempty(n))
-                        cid = VMADDR_CID_ANY;
-                else {
-                        r = safe_atou(n, &cid);
-                        if (r < 0)
-                                return r;
-                }
-
-                *a = (SocketAddress) {
-                        .sockaddr.vm = {
-                                .svm_cid = cid,
-                                .svm_family = AF_VSOCK,
-                                .svm_port = port,
-                        },
-                        .size = sizeof(struct sockaddr_vm),
-                };
+        r = parse_ip_port(s, &port);
+        if (r == -ERANGE)
+                return r; /* Valid port syntax, but the numerical value is wrong for a port. */
+        if (r >= 0) {
+                /* Just a port */
+                if (socket_ipv6_is_supported())
+                        *a = (SocketAddress) {
+                                .sockaddr.in6 = {
+                                        .sin6_family = AF_INET6,
+                                        .sin6_port = htobe16(port),
+                                        .sin6_addr = in6addr_any,
+                                },
+                                .size = sizeof(struct sockaddr_in6),
+                        };
+                else
+                        *a = (SocketAddress) {
+                                .sockaddr.in = {
+                                        .sin_family = AF_INET,
+                                        .sin_port = htobe16(port),
+                                        .sin_addr.s_addr = INADDR_ANY,
+                                },
+                                .size = sizeof(struct sockaddr_in),
+                        };
 
         } else {
-                uint16_t port;
+                union in_addr_union address;
+                int family, ifindex;
 
-                r = parse_ip_port(s, &port);
-                if (r == -ERANGE)
-                        return r; /* Valid port syntax, but the numerical value is wrong for a port. */
-                if (r >= 0) {
-                        /* Just a port */
-                        if (socket_ipv6_is_supported())
-                                *a = (SocketAddress) {
-                                        .sockaddr.in6 = {
-                                                .sin6_family = AF_INET6,
-                                                .sin6_port = htobe16(port),
-                                                .sin6_addr = in6addr_any,
-                                        },
-                                        .size = sizeof(struct sockaddr_in6),
-                                };
-                        else
-                                *a = (SocketAddress) {
-                                        .sockaddr.in = {
-                                                .sin_family = AF_INET,
-                                                .sin_port = htobe16(port),
-                                                .sin_addr.s_addr = INADDR_ANY,
-                                        },
-                                        .size = sizeof(struct sockaddr_in),
-                                };
+                r = in_addr_port_ifindex_name_from_string_auto(s, &family, &address, &port, &ifindex, NULL);
+                if (r < 0)
+                        return r;
 
-                } else {
-                        union in_addr_union address;
-                        int family, ifindex;
+                if (port == 0) /* No port, no go. */
+                        return -EINVAL;
 
-                        r = in_addr_port_ifindex_name_from_string_auto(s, &family, &address, &port, &ifindex, NULL);
-                        if (r < 0)
-                                return r;
-
-                        if (port == 0) /* No port, no go. */
-                                return -EINVAL;
-
-                        if (family == AF_INET)
-                                *a = (SocketAddress) {
-                                        .sockaddr.in = {
-                                                .sin_family = AF_INET,
-                                                .sin_addr = address.in,
-                                                .sin_port = htobe16(port),
-                                        },
-                                        .size = sizeof(struct sockaddr_in),
-                                };
-                        else if (family == AF_INET6)
-                                *a = (SocketAddress) {
-                                        .sockaddr.in6 = {
-                                                .sin6_family = AF_INET6,
-                                                .sin6_addr = address.in6,
-                                                .sin6_port = htobe16(port),
-                                                .sin6_scope_id = ifindex,
-                                        },
-                                        .size = sizeof(struct sockaddr_in6),
-                                };
-                        else
-                                assert_not_reached("Family quarrel");
-                }
+                if (family == AF_INET)
+                        *a = (SocketAddress) {
+                                .sockaddr.in = {
+                                        .sin_family = AF_INET,
+                                        .sin_addr = address.in,
+                                        .sin_port = htobe16(port),
+                                },
+                                .size = sizeof(struct sockaddr_in),
+                        };
+                else if (family == AF_INET6)
+                        *a = (SocketAddress) {
+                                .sockaddr.in6 = {
+                                        .sin6_family = AF_INET6,
+                                        .sin6_addr = address.in6,
+                                        .sin6_port = htobe16(port),
+                                        .sin6_scope_id = ifindex,
+                                },
+                                .size = sizeof(struct sockaddr_in6),
+                        };
+                else
+                        assert_not_reached();
         }
 
         return 0;
@@ -264,8 +184,18 @@ int make_socket_fd(int log_level, const char* address, int type, int flags) {
 
         a.type = type;
 
-        fd = socket_address_listen(&a, type | flags, SOMAXCONN, SOCKET_ADDRESS_DEFAULT,
-                                   NULL, false, false, false, 0755, 0644, NULL);
+        fd = socket_address_listen(
+                        &a,
+                        type | flags,
+                        SOMAXCONN_DELUXE, SOCKET_ADDRESS_DEFAULT,
+                        /* bind_to_device= */ NULL,
+                        /* reuse_port= */ false,
+                        /* free_bind= */ false,
+                        /* transparent= */ false,
+                        0755,
+                        0644,
+                        /* selinux_label= */ NULL,
+                        /* smack_label= */ NULL);
         if (fd < 0 || log_get_max_level() >= log_level) {
                 _cleanup_free_ char *p = NULL;
 
@@ -338,7 +268,7 @@ int in_addr_port_ifindex_name_from_string_auto(
                         return -EINVAL; /* We want to return -EINVAL for syntactically invalid names,
                                          * and -ENODEV for valid but nonexistent interfaces. */
 
-                ifindex = resolve_interface(NULL, m + 1);
+                ifindex = rtnl_resolve_interface(NULL, m + 1);
                 if (ifindex < 0)
                         return ifindex;
 
@@ -427,6 +357,15 @@ struct in_addr_full *in_addr_full_free(struct in_addr_full *a) {
         return mfree(a);
 }
 
+void in_addr_full_array_free(struct in_addr_full *addrs[], size_t n) {
+        assert(addrs || n == 0);
+
+        FOREACH_ARRAY(a, addrs, n)
+                in_addr_full_freep(a);
+
+        free(addrs);
+}
+
 int in_addr_full_new(
                 int family,
                 const union in_addr_union *a,
@@ -477,7 +416,7 @@ int in_addr_full_new_from_string(const char *s, struct in_addr_full **ret) {
         return in_addr_full_new(family, &a, port, ifindex, server_name, ret);
 }
 
-const char *in_addr_full_to_string(struct in_addr_full *a) {
+const char* in_addr_full_to_string(struct in_addr_full *a) {
         assert(a);
 
         if (!a->cached_server_string)
@@ -490,4 +429,122 @@ const char *in_addr_full_to_string(struct in_addr_full *a) {
                                 &a->cached_server_string);
 
         return a->cached_server_string;
+}
+
+int netns_get_nsid(int netnsfd, uint32_t *ret) {
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *req = NULL, *reply = NULL;
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
+        _cleanup_close_ int _netns_fd = -EBADF;
+        int r;
+
+        if (netnsfd < 0) {
+                _netns_fd = namespace_open_by_type(NAMESPACE_NET);
+                if (_netns_fd < 0)
+                        return _netns_fd;
+
+                netnsfd = _netns_fd;
+        }
+
+        r = sd_netlink_open(&rtnl);
+        if (r < 0)
+                return r;
+
+        r = sd_rtnl_message_new_nsid(rtnl, &req, RTM_GETNSID);
+        if (r < 0)
+                return r;
+
+        r = sd_netlink_message_append_s32(req, NETNSA_FD, netnsfd);
+        if (r < 0)
+                return r;
+
+        r = sd_netlink_call(rtnl, req, 0, &reply);
+        if (r < 0)
+                return r;
+
+        for (sd_netlink_message *m = reply; m; m = sd_netlink_message_next(m)) {
+                uint16_t type;
+
+                r = sd_netlink_message_get_errno(m);
+                if (r < 0)
+                        return r;
+
+                r = sd_netlink_message_get_type(m, &type);
+                if (r < 0)
+                        return r;
+                if (type != RTM_NEWNSID)
+                        continue;
+
+                uint32_t u;
+                r = sd_netlink_message_read_u32(m, NETNSA_NSID, &u);
+                if (r < 0)
+                        return r;
+
+                if (u == (uint32_t) NETNSA_NSID_NOT_ASSIGNED) /* no NSID assigned yet */
+                        return -ENODATA;
+
+                if (ret)
+                        *ret = u;
+
+                return 0;
+        }
+
+        return -ENXIO;
+}
+
+int af_unix_get_qlen(int fd, uint32_t *ret) {
+        int r;
+
+        assert(fd >= 0);
+        assert(ret);
+
+        /* Returns the current queue length for an AF_UNIX listening socket */
+
+        struct stat st;
+        if (fstat(fd, &st) < 0)
+                return -errno;
+        if (!S_ISSOCK(st.st_mode))
+                return -ENOTSOCK;
+
+        _cleanup_(sd_netlink_unrefp) sd_netlink *nl = NULL;
+        r = sd_sock_diag_socket_open(&nl);
+        if (r < 0)
+                return r;
+
+        uint64_t cookie;
+        r = socket_get_cookie(fd, &cookie);
+        if (r < 0)
+                return r;
+
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
+        r = sd_sock_diag_message_new_unix(nl, &message, st.st_ino, cookie, UDIAG_SHOW_RQLEN);
+        if (r < 0)
+                return r;
+
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *reply = NULL;
+        r = sd_netlink_call(nl, message, /* timeout= */ 0, &reply);
+        if (r < 0)
+                return r;
+
+        for (sd_netlink_message *m = reply; m; m = sd_netlink_message_next(m)) {
+                r = sd_netlink_message_get_errno(m);
+                if (r < 0)
+                        return r;
+
+                _cleanup_free_ void *data = NULL;
+                size_t size = 0;
+
+                r = sd_netlink_message_read_data(m, UNIX_DIAG_RQLEN, &size, &data);
+                if (r == -ENODATA)
+                        continue;
+                if (r < 0)
+                        return r;
+
+                assert(size == sizeof(struct unix_diag_rqlen));
+                const struct unix_diag_rqlen *udrql = ASSERT_PTR(data);
+
+                *ret = udrql->udiag_rqueue;
+                return 0;
+        }
+
+        return -ENODATA;
 }

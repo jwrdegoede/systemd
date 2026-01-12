@@ -1,8 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
+
+#include "alloc-util.h"
 #include "bus-introspect.h"
 #include "bus-object.h"
-#include "macro.h"
+#include "log.h"
+#include "ordered-set.h"
 #include "string-util.h"
 #include "strv.h"
 
@@ -80,7 +84,7 @@ static const BusObjectImplementation* find_implementation(
 }
 
 static int bus_introspect_implementation(
-                struct introspect *intro,
+                BusIntrospect *intro,
                 const BusObjectImplementation *impl) {
         int r;
 
@@ -113,7 +117,7 @@ static void list_paths(
 int bus_introspect_implementations(
                 FILE *out,
                 const char *pattern,
-                const BusObjectImplementation* const* bus_objects) {
+                const BusObjectImplementation* const *bus_objects) {
 
         const BusObjectImplementation *impl, *main_impl = NULL;
         _cleanup_free_ char *s = NULL;
@@ -124,7 +128,7 @@ int bus_introspect_implementations(
                 return 0;
         }
 
-        struct introspect intro = {};
+        BusIntrospect intro = {};
         bool is_interface = sd_bus_interface_name_is_valid(pattern);
 
         impl = find_implementation(pattern, bus_objects);
@@ -156,10 +160,10 @@ int bus_introspect_implementations(
         if (impl != main_impl)
                 bus_introspect_implementation(&intro, impl);
 
-        _cleanup_set_free_ Set *nodes = NULL;
+        _cleanup_ordered_set_free_ OrderedSet *nodes = NULL;
 
         for (size_t i = 0; impl->children && impl->children[i]; i++) {
-                r = set_put_strdup(&nodes, impl->children[i]->path);
+                r = ordered_set_put_strdup(&nodes, impl->children[i]->path);
                 if (r < 0)
                         return log_oom();
         }

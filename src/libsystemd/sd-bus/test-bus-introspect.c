@@ -2,12 +2,11 @@
 
 #include "bus-introspect.h"
 #include "log.h"
+#include "test-vtable-data.h"
 #include "tests.h"
 
-#include "test-vtable-data.h"
-
-static void test_manual_introspection(const sd_bus_vtable vtable[]) {
-        struct introspect intro = {};
+static void test_manual_introspection_one(const sd_bus_vtable vtable[]) {
+        BusIntrospect intro = {};
         _cleanup_free_ char *s = NULL;
 
         log_info("/* %s */", __func__);
@@ -23,13 +22,11 @@ static void test_manual_introspection(const sd_bus_vtable vtable[]) {
         fputs("\n", stdout);
 }
 
-int main(int argc, char *argv[]) {
-        test_setup_logging(LOG_DEBUG);
-
-        test_manual_introspection(test_vtable_1);
-        test_manual_introspection(test_vtable_2);
-        test_manual_introspection(test_vtable_deprecated);
-        test_manual_introspection((const sd_bus_vtable *) vtable_format_221);
-
-        return 0;
+TEST(manual_introspection) {
+        test_manual_introspection_one(test_vtable_1);
+        test_manual_introspection_one(test_vtable_2);
+        test_manual_introspection_one(test_vtable_deprecated);
+        test_manual_introspection_one((const sd_bus_vtable *) vtable_format_221);
 }
+
+DEFINE_TEST_MAIN(LOG_DEBUG);

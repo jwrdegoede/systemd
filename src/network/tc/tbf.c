@@ -2,22 +2,19 @@
  * Copyright © 2019 VMware, Inc. */
 
 #include <linux/pkt_sched.h>
-#include <math.h>
 
-#include "alloc-util.h"
-#include "conf-parser.h"
-#include "netem.h"
-#include "netlink-util.h"
-#include "networkd-manager.h"
+#include "sd-netlink.h"
+
+#include "log-link.h"
+#include "networkd-link.h"
 #include "parse-util.h"
-#include "qdisc.h"
-#include "string-util.h"
 #include "strv.h"
+#include "tbf.h"
 #include "tc-util.h"
+#include "string-util.h"
 
 static int token_bucket_filter_fill_message(Link *link, QDisc *qdisc, sd_netlink_message *req) {
         uint32_t rtab[256], ptab[256];
-        struct tc_tbf_qopt opt = {};
         TokenBucketFilter *tbf;
         int r;
 
@@ -25,10 +22,13 @@ static int token_bucket_filter_fill_message(Link *link, QDisc *qdisc, sd_netlink
         assert(qdisc);
         assert(req);
 
-        tbf = TBF(qdisc);
+        assert_se(tbf = TBF(qdisc));
 
-        opt.rate.rate = tbf->rate >= (1ULL << 32) ? ~0U : tbf->rate;
-        opt.peakrate.rate = tbf->peak_rate >= (1ULL << 32) ? ~0U : tbf->peak_rate;
+        struct tc_tbf_qopt opt = {
+                .rate.rate = tbf->rate >= (1ULL << 32) ? ~0U : tbf->rate,
+                .peakrate.rate = tbf->peak_rate >= (1ULL << 32) ? ~0U : tbf->peak_rate,
+                .rate.mpu = tbf->mpu,
+        };
 
         if (tbf->limit > 0)
                 opt.limit = tbf->limit;
@@ -43,74 +43,72 @@ static int token_bucket_filter_fill_message(Link *link, QDisc *qdisc, sd_netlink
                 opt.limit = lim;
         }
 
-        opt.rate.mpu = tbf->mpu;
-
         r = tc_fill_ratespec_and_table(&opt.rate, rtab, tbf->mtu);
         if (r < 0)
-                return log_link_error_errno(link, r, "Failed to calculate ratespec: %m");
+                return log_link_debug_errno(link, r, "Failed to calculate ratespec: %m");
 
         r = tc_transmit_time(opt.rate.rate, tbf->burst, &opt.buffer);
         if (r < 0)
-                return log_link_error_errno(link, r, "Failed to calculate buffer size: %m");
+                return log_link_debug_errno(link, r, "Failed to calculate buffer size: %m");
 
         if (opt.peakrate.rate > 0) {
                 opt.peakrate.mpu = tbf->mpu;
 
                 r = tc_fill_ratespec_and_table(&opt.peakrate, ptab, tbf->mtu);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Failed to calculate ratespec: %m");
+                        return log_link_debug_errno(link, r, "Failed to calculate ratespec: %m");
 
                 r = tc_transmit_time(opt.peakrate.rate, tbf->mtu, &opt.mtu);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Failed to calculate mtu size: %m");
+                        return log_link_debug_errno(link, r, "Failed to calculate mtu size: %m");
         }
 
         r = sd_netlink_message_open_container_union(req, TCA_OPTIONS, "tbf");
         if (r < 0)
-                return log_link_error_errno(link, r, "Could not open container TCA_OPTIONS: %m");
+                return r;
 
-        r = sd_netlink_message_append_data(req, TCA_TBF_PARMS, &opt, sizeof(struct tc_tbf_qopt));
+        r = sd_netlink_message_append_data(req, TCA_TBF_PARMS, &opt, sizeof(opt));
         if (r < 0)
-                return log_link_error_errno(link, r, "Could not append TCA_TBF_PARMS attribute: %m");
+                return r;
 
         r = sd_netlink_message_append_data(req, TCA_TBF_BURST, &tbf->burst, sizeof(tbf->burst));
         if (r < 0)
-                return log_link_error_errno(link, r, "Could not append TCA_TBF_BURST attribute: %m");
+                return r;
 
         if (tbf->rate >= (1ULL << 32)) {
                 r = sd_netlink_message_append_u64(req, TCA_TBF_RATE64, tbf->rate);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_TBF_RATE64 attribute: %m");
+                        return r;
         }
 
         r = sd_netlink_message_append_data(req, TCA_TBF_RTAB, rtab, sizeof(rtab));
         if (r < 0)
-                return log_link_error_errno(link, r, "Could not append TCA_TBF_RTAB attribute: %m");
+                return r;
 
         if (opt.peakrate.rate > 0) {
                 if (tbf->peak_rate >= (1ULL << 32)) {
                         r = sd_netlink_message_append_u64(req, TCA_TBF_PRATE64, tbf->peak_rate);
                         if (r < 0)
-                                return log_link_error_errno(link, r, "Could not append TCA_TBF_PRATE64 attribute: %m");
+                                return r;
                 }
 
                 r = sd_netlink_message_append_u32(req, TCA_TBF_PBURST, tbf->mtu);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_TBF_PBURST attribute: %m");
+                        return r;
 
                 r = sd_netlink_message_append_data(req, TCA_TBF_PTAB, ptab, sizeof(ptab));
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_TBF_PTAB attribute: %m");
+                        return r;
         }
 
         r = sd_netlink_message_close_container(req);
         if (r < 0)
-                return log_link_error_errno(link, r, "Could not close container TCA_OPTIONS: %m");
+                return r;
 
         return 0;
 }
 
-int config_parse_token_bucket_filter_size(
+int config_parse_tbf_size(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -122,8 +120,8 @@ int config_parse_token_bucket_filter_size(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
-        Network *network = data;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
+        Network *network = ASSERT_PTR(data);
         TokenBucketFilter *tbf;
         uint64_t k;
         int r;
@@ -131,7 +129,6 @@ int config_parse_token_bucket_filter_size(
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         r = qdisc_new_static(QDISC_KIND_TBF, network, filename, section_line, &qdisc);
         if (r == -ENOMEM)
@@ -154,9 +151,9 @@ int config_parse_token_bucket_filter_size(
                 else if (streq(lvalue, "MPUBytes"))
                         tbf->mpu = 0;
                 else
-                        assert_not_reached("unknown lvalue");
+                        assert_not_reached();
 
-                qdisc = NULL;
+                TAKE_PTR(qdisc);
                 return 0;
         }
 
@@ -177,14 +174,14 @@ int config_parse_token_bucket_filter_size(
         else if (streq(lvalue, "MTUBytes"))
                 tbf->mtu = k;
         else
-                assert_not_reached("unknown lvalue");
+                assert_not_reached();
 
-        qdisc = NULL;
+        TAKE_PTR(qdisc);
 
         return 0;
 }
 
-int config_parse_token_bucket_filter_rate(
+int config_parse_tbf_rate(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -196,8 +193,8 @@ int config_parse_token_bucket_filter_rate(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
-        Network *network = data;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
+        Network *network = ASSERT_PTR(data);
         TokenBucketFilter *tbf;
         uint64_t k, *p;
         int r;
@@ -205,7 +202,6 @@ int config_parse_token_bucket_filter_rate(
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         r = qdisc_new_static(QDISC_KIND_TBF, network, filename, section_line, &qdisc);
         if (r == -ENOMEM)
@@ -222,12 +218,12 @@ int config_parse_token_bucket_filter_rate(
         else if (streq(lvalue, "PeakRate"))
                 p = &tbf->peak_rate;
         else
-                assert_not_reached("unknown lvalue");
+                assert_not_reached();
 
         if (isempty(rvalue)) {
                 *p = 0;
 
-                qdisc = NULL;
+                TAKE_PTR(qdisc);
                 return 0;
         }
 
@@ -246,7 +242,7 @@ int config_parse_token_bucket_filter_rate(
         return 0;
 }
 
-int config_parse_token_bucket_filter_latency(
+int config_parse_tbf_latency(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -258,8 +254,8 @@ int config_parse_token_bucket_filter_latency(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
-        Network *network = data;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
+        Network *network = ASSERT_PTR(data);
         TokenBucketFilter *tbf;
         usec_t u;
         int r;
@@ -267,7 +263,6 @@ int config_parse_token_bucket_filter_latency(
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         r = qdisc_new_static(QDISC_KIND_TBF, network, filename, section_line, &qdisc);
         if (r == -ENOMEM)
@@ -307,13 +302,13 @@ static int token_bucket_filter_verify(QDisc *qdisc) {
 
         if (tbf->limit > 0 && tbf->latency > 0)
                 return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
-                                         "%s: Specifying both LimitSize= and LatencySec= is not allowed. "
+                                         "%s: Specifying both LimitBytes= and LatencySec= is not allowed. "
                                          "Ignoring [TokenBucketFilter] section from line %u.",
                                          qdisc->section->filename, qdisc->section->line);
 
         if (tbf->limit == 0 && tbf->latency == 0)
                 return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
-                                         "%s: Either LimitSize= or LatencySec= is required. "
+                                         "%s: Either LimitBytes= or LatencySec= is required. "
                                          "Ignoring [TokenBucketFilter] section from line %u.",
                                          qdisc->section->filename, qdisc->section->line);
 
@@ -325,7 +320,7 @@ static int token_bucket_filter_verify(QDisc *qdisc) {
 
         if (tbf->burst == 0)
                 return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
-                                         "%s: Burst= is mandatory. "
+                                         "%s: BurstBytes= is mandatory. "
                                          "Ignoring [TokenBucketFilter] section from line %u.",
                                          qdisc->section->filename, qdisc->section->line);
 

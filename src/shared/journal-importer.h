@@ -2,13 +2,10 @@
 
 #pragma once
 
-#include <stddef.h>
-#include <stdbool.h>
-#include <sys/uio.h>
-
 #include "sd-id128.h"
 
-#include "io-util.h"
+#include "shared-forward.h"
+#include "iovec-wrapper.h"
 #include "time-util.h"
 
 /* Make sure not to make this smaller than the maximum coredump size.
@@ -23,7 +20,7 @@
 #define LINE_CHUNK 8*1024u
 
 /* The maximum number of fields in an entry */
-#define ENTRY_FIELD_COUNT_MAX 1024
+#define ENTRY_FIELD_COUNT_MAX 1024u
 
 typedef struct JournalImporter {
         int fd;
@@ -31,7 +28,6 @@ typedef struct JournalImporter {
         char *name;
 
         char *buf;
-        size_t size;       /* total size of the buffer */
         size_t offset;     /* offset to the beginning of live data in the buffer */
         size_t scanned;    /* number of bytes since the beginning of data without a newline */
         size_t filled;     /* total number of bytes in the buffer */
@@ -49,11 +45,11 @@ typedef struct JournalImporter {
 #define JOURNAL_IMPORTER_INIT(_fd) { .fd = (_fd), .iovw = {} }
 #define JOURNAL_IMPORTER_MAKE(_fd) (JournalImporter) JOURNAL_IMPORTER_INIT(_fd)
 
-void journal_importer_cleanup(JournalImporter *);
-int journal_importer_process_data(JournalImporter *);
-int journal_importer_push_data(JournalImporter *, const char *data, size_t size);
-void journal_importer_drop_iovw(JournalImporter *);
-bool journal_importer_eof(const JournalImporter *);
+void journal_importer_cleanup(JournalImporter *imp);
+int journal_importer_process_data(JournalImporter *imp);
+int journal_importer_push_data(JournalImporter *imp, const char *data, size_t size);
+void journal_importer_drop_iovw(JournalImporter *imp);
+bool journal_importer_eof(const JournalImporter *imp);
 
 static inline size_t journal_importer_bytes_remaining(const JournalImporter *imp) {
         return imp->filled;

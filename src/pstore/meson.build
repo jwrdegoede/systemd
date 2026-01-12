@@ -1,10 +1,23 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-systemd_pstore_sources = files('''
-        pstore.c
-'''.split())
+if conf.get('ENABLE_PSTORE') != 1
+        subdir_done()
+endif
 
-if conf.get('ENABLE_PSTORE') == 1 and install_sysconfdir
+executables += [
+        libexec_template + {
+                'name' : 'systemd-pstore',
+                'sources' : files('pstore.c'),
+                'dependencies' : [
+                        liblz4_cflags,
+                        libxz_cflags,
+                        libzstd_cflags,
+                        threads,
+                ],
+        },
+]
+
+if install_sysconfdir_samples
         install_data('pstore.conf',
-                     install_dir : pkgsysconfdir)
+                     install_dir : pkgconfigfiledir)
 endif

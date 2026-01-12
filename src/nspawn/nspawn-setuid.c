@@ -1,60 +1,51 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "def.h"
 #include "errno.h"
+#include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "log.h"
 #include "mkdir.h"
 #include "nspawn-setuid.h"
+#include "pidref.h"
 #include "process-util.h"
-#include "rlimit-util.h"
-#include "signal-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "user-util.h"
-#include "util.h"
 
-static int spawn_getent(const char *database, const char *key, pid_t *rpid) {
+static int spawn_getent(const char *database, const char *key, PidRef *ret) {
         int pipe_fds[2], r;
-        pid_t pid;
 
         assert(database);
         assert(key);
-        assert(rpid);
+        assert(ret);
 
         if (pipe2(pipe_fds, O_CLOEXEC) < 0)
                 return log_error_errno(errno, "Failed to allocate pipe: %m");
 
-        r = safe_fork("(getent)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG, &pid);
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = pidref_safe_fork_full(
+                        "(getent)",
+                        (int[]) { -EBADF, pipe_fds[1], -EBADF }, NULL, 0,
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
+                        &pidref);
         if (r < 0) {
                 safe_close_pair(pipe_fds);
                 return r;
         }
         if (r == 0) {
-                char *empty_env = NULL;
-
-                safe_close(pipe_fds[0]);
-
-                if (rearrange_stdio(-1, pipe_fds[1], -1) < 0)
-                        _exit(EXIT_FAILURE);
-
-                (void) close_all_fds(NULL, 0);
-
-                (void) rlimit_nofile_safe();
-
-                execle("/usr/bin/getent", "getent", database, key, NULL, &empty_env);
-                execle("/bin/getent", "getent", database, key, NULL, &empty_env);
+                execle("/usr/bin/getent", "getent", database, key, NULL, &(char*[1]){});
+                execle("/bin/getent", "getent", database, key, NULL, &(char*[1]){});
                 _exit(EXIT_FAILURE);
         }
 
         pipe_fds[1] = safe_close(pipe_fds[1]);
 
-        *rpid = pid;
+        *ret = TAKE_PIDREF(pidref);
 
         return pipe_fds[0];
 }
@@ -65,6 +56,8 @@ int change_uid_gid_raw(
                 const gid_t *supplementary_gids,
                 size_t n_supplementary_gids,
                 bool chown_stdio) {
+
+        int r;
 
         if (!uid_is_valid(uid))
                 uid = 0;
@@ -77,14 +70,9 @@ int change_uid_gid_raw(
                 (void) fchown(STDERR_FILENO, uid, gid);
         }
 
-        if (setgroups(n_supplementary_gids, supplementary_gids) < 0)
-                return log_error_errno(errno, "Failed to set auxiliary groups: %m");
-
-        if (setresgid(gid, gid, gid) < 0)
-                return log_error_errno(errno, "setresgid() failed: %m");
-
-        if (setresuid(uid, uid, uid) < 0)
-                return log_error_errno(errno, "setresuid() failed: %m");
+        r = fully_set_uid_gid(uid, gid, supplementary_gids, n_supplementary_gids);
+        if (r < 0)
+                return log_error_errno(r, "Changing privileges failed: %m");
 
         return 0;
 }
@@ -94,12 +82,10 @@ int change_uid_gid(const char *user, bool chown_stdio, char **ret_home) {
         _cleanup_free_ gid_t *gids = NULL;
         _cleanup_free_ char *home = NULL, *line = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         unsigned n_gids = 0;
-        size_t sz = 0;
         uid_t uid;
         gid_t gid;
-        pid_t pid;
         int r;
 
         assert(ret_home);
@@ -116,7 +102,8 @@ int change_uid_gid(const char *user, bool chown_stdio, char **ret_home) {
         }
 
         /* First, get user credentials */
-        fd = spawn_getent("passwd", user, &pid);
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        fd = spawn_getent("passwd", user, &pidref);
         if (fd < 0)
                 return fd;
 
@@ -131,7 +118,7 @@ int change_uid_gid(const char *user, bool chown_stdio, char **ret_home) {
         if (r < 0)
                 return log_error_errno(r, "Failed to read from getent: %m");
 
-        (void) wait_for_terminate_and_check("getent passwd", pid, WAIT_LOG);
+        (void) pidref_wait_for_terminate_and_check("getent passwd", &pidref, WAIT_LOG);
 
         x = strchr(line, ':');
         if (!x)
@@ -188,7 +175,8 @@ int change_uid_gid(const char *user, bool chown_stdio, char **ret_home) {
         line = mfree(line);
 
         /* Second, get group memberships */
-        fd = spawn_getent("initgroups", user, &pid);
+        pidref_done(&pidref);
+        fd = spawn_getent("initgroups", user, &pidref);
         if (fd < 0)
                 return fd;
 
@@ -203,7 +191,7 @@ int change_uid_gid(const char *user, bool chown_stdio, char **ret_home) {
         if (r < 0)
                 return log_error_errno(r, "Failed to read from getent: %m");
 
-        (void) wait_for_terminate_and_check("getent initgroups", pid, WAIT_LOG);
+        (void) pidref_wait_for_terminate_and_check("getent initgroups", &pidref, WAIT_LOG);
 
         /* Skip over the username and subsequent separator whitespace */
         x = line;
@@ -219,7 +207,7 @@ int change_uid_gid(const char *user, bool chown_stdio, char **ret_home) {
                 if (r == 0)
                         break;
 
-                if (!GREEDY_REALLOC(gids, sz, n_gids+1))
+                if (!GREEDY_REALLOC(gids, n_gids+1))
                         return log_oom();
 
                 r = parse_gid(word, &gids[n_gids++]);

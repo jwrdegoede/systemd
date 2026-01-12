@@ -2,40 +2,162 @@
 
 #include "sd-netlink.h"
 
-#include "format-util.h"
+#include "ether-addr-util.h"
+#include "fd-util.h"
+#include "hashmap.h"
+#include "iovec-util.h"
+#include "log.h"
 #include "memory-util.h"
 #include "netlink-internal.h"
 #include "netlink-util.h"
+#include "parse-util.h"
+#include "process-util.h"
+#include "socket-util.h"
+#include "string-util.h"
 #include "strv.h"
 
-int rtnl_set_link_name(sd_netlink **rtnl, int ifindex, const char *name) {
+static int parse_newlink_message(
+                  sd_netlink_message *message,
+                  char **ret_name,
+                  char ***ret_altnames) {
+
+        _cleanup_strv_free_ char **altnames = NULL;
+        int r, ifindex;
+
+        assert(message);
+
+        uint16_t type;
+        r = sd_netlink_message_get_type(message, &type);
+        if (r < 0)
+                return r;
+        if (type != RTM_NEWLINK)
+                return -EPROTO;
+
+        r = sd_rtnl_message_link_get_ifindex(message, &ifindex);
+        if (r < 0)
+                return r;
+        if (ifindex <= 0)
+                return -EPROTO;
+
+        if (ret_altnames) {
+                r = sd_netlink_message_read_strv(message, IFLA_PROP_LIST, IFLA_ALT_IFNAME, &altnames);
+                if (r < 0 && r != -ENODATA)
+                        return r;
+        }
+
+        if (ret_name) {
+                r = sd_netlink_message_read_string_strdup(message, IFLA_IFNAME, ret_name);
+                if (r < 0)
+                        return r;
+        }
+
+        if (ret_altnames)
+                *ret_altnames = TAKE_PTR(altnames);
+
+        return ifindex;
+}
+
+int rtnl_resolve_ifname_full(
+                  sd_netlink **rtnl,
+                  ResolveInterfaceNameFlag flags,
+                  const char *name,
+                  char **ret_name,
+                  char ***ret_altnames) {
+
+        _cleanup_(sd_netlink_unrefp) sd_netlink *our_rtnl = NULL;
+        int r;
+
+        assert(name);
+        assert(flags > 0);
+
+        /* This is similar to if_nametoindex(), but also resolves alternative names and decimal formatted
+         * ifindex too. Returns ifindex, and optionally provides the main interface name and alternative
+         * names. */
+
+        if (!rtnl)
+                rtnl = &our_rtnl;
+        if (!*rtnl) {
+                r = sd_netlink_open(rtnl);
+                if (r < 0)
+                        return r;
+        }
+
+        /* First, use IFLA_IFNAME */
+        if (FLAGS_SET(flags, RESOLVE_IFNAME_MAIN) && ifname_valid(name)) {
+                _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL, *reply = NULL;
+
+                r = sd_rtnl_message_new_link(*rtnl, &message, RTM_GETLINK, 0);
+                if (r < 0)
+                        return r;
+
+                r = sd_netlink_message_append_string(message, IFLA_IFNAME, name);
+                if (r < 0)
+                        return r;
+
+                r = sd_netlink_call(*rtnl, message, 0, &reply);
+                if (r >= 0)
+                        return parse_newlink_message(reply, ret_name, ret_altnames);
+                if (r != -ENODEV)
+                        return r;
+        }
+
+        /* Next, try IFLA_ALT_IFNAME */
+        if (FLAGS_SET(flags, RESOLVE_IFNAME_ALTERNATIVE) &&
+            ifname_valid_full(name, IFNAME_VALID_ALTERNATIVE)) {
+                _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL, *reply = NULL;
+
+                r = sd_rtnl_message_new_link(*rtnl, &message, RTM_GETLINK, 0);
+                if (r < 0)
+                        return r;
+
+                r = sd_netlink_message_append_string(message, IFLA_ALT_IFNAME, name);
+                if (r < 0)
+                        return r;
+
+                r = sd_netlink_call(*rtnl, message, 0, &reply);
+                if (r >= 0)
+                        return parse_newlink_message(reply, ret_name, ret_altnames);
+                /* The kernels older than 76c9ac0ee878f6693d398d3a95ccaf85e1f597a6 (v5.5) return -EINVAL. */
+                if (!IN_SET(r, -ENODEV, -EINVAL))
+                        return r;
+        }
+
+        /* Finally, assume the string is a decimal formatted ifindex. */
+        if (FLAGS_SET(flags, RESOLVE_IFNAME_NUMERIC)) {
+                int ifindex;
+
+                ifindex = parse_ifindex(name);
+                if (ifindex <= 0)
+                        return -ENODEV;
+
+                return rtnl_get_ifname_full(rtnl, ifindex, ret_name, ret_altnames);
+        }
+
+        return -ENODEV;
+}
+
+int rtnl_resolve_interface_or_warn(sd_netlink **rtnl, const char *name) {
+        int r;
+
+        assert(name);
+
+        r = rtnl_resolve_interface(rtnl, name);
+        if (r < 0)
+                return log_error_errno(r, "Failed to resolve interface \"%s\": %m", name);
+        return r;
+}
+
+static int set_link_name(sd_netlink *rtnl, int ifindex, const char *name) {
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
-        _cleanup_strv_free_ char **alternative_names = NULL;
-        char old_name[IF_NAMESIZE + 1] = {};
         int r;
 
         assert(rtnl);
         assert(ifindex > 0);
         assert(name);
 
-        if (!ifname_valid(name))
-                return -EINVAL;
+        /* Assign the requested name. */
 
-        r = rtnl_get_link_alternative_names(rtnl, ifindex, &alternative_names);
-        if (r < 0)
-                log_debug_errno(r, "Failed to get alternative names on network interface %i, ignoring: %m",
-                                ifindex);
-
-        if (strv_contains(alternative_names, name)) {
-                r = rtnl_delete_link_alternative_names(rtnl, ifindex, STRV_MAKE(name));
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to remove '%s' from alternative names on network interface %i: %m",
-                                               name, ifindex);
-
-                format_ifname(ifindex, old_name);
-        }
-
-        r = sd_rtnl_message_new_link(*rtnl, &message, RTM_SETLINK, ifindex);
+        r = sd_rtnl_message_new_link(rtnl, &message, RTM_SETLINK, ifindex);
         if (r < 0)
                 return r;
 
@@ -43,37 +165,160 @@ int rtnl_set_link_name(sd_netlink **rtnl, int ifindex, const char *name) {
         if (r < 0)
                 return r;
 
-        r = sd_netlink_call(*rtnl, message, 0, NULL);
-        if (r < 0)
-                return r;
-
-        if (!isempty(old_name)) {
-                r = rtnl_set_link_alternative_names(rtnl, ifindex, STRV_MAKE(old_name));
-                if (r < 0)
-                        log_debug_errno(r, "Failed to set '%s' as an alternative name on network interface %i, ignoring: %m",
-                                        old_name, ifindex);
-        }
-
-        return 0;
+        return sd_netlink_call(rtnl, message, 0, NULL);
 }
 
-int rtnl_set_link_properties(sd_netlink **rtnl, int ifindex, const char *alias,
-                             const struct ether_addr *mac, uint32_t mtu) {
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
-        int r;
+int rtnl_rename_link(sd_netlink **rtnl, const char *orig_name, const char *new_name) {
+        _cleanup_(sd_netlink_unrefp) sd_netlink *our_rtnl = NULL;
+        int r, ifindex;
 
-        assert(rtnl);
-        assert(ifindex > 0);
+        assert(orig_name);
+        assert(new_name);
 
-        if (!alias && !mac && mtu == 0)
+        /* This does not check alternative names. Callers must check the requested name is not used as an
+         * alternative name. */
+
+        if (streq(orig_name, new_name))
                 return 0;
 
+        if (!ifname_valid(new_name))
+                return -EINVAL;
+
+        if (!rtnl)
+                rtnl = &our_rtnl;
         if (!*rtnl) {
                 r = sd_netlink_open(rtnl);
                 if (r < 0)
                         return r;
         }
 
+        ifindex = rtnl_resolve_ifname(rtnl, orig_name);
+        if (ifindex < 0)
+                return ifindex;
+
+        return set_link_name(*rtnl, ifindex, new_name);
+}
+
+int rtnl_set_link_name(sd_netlink **rtnl, int ifindex, const char *name, char* const *alternative_names) {
+        _cleanup_strv_free_ char **original_altnames = NULL, **new_altnames = NULL;
+        bool altname_deleted = false;
+        int r;
+
+        assert(ifindex > 0);
+
+        if (isempty(name) && strv_isempty(alternative_names))
+                return 0;
+
+        if (name && !ifname_valid(name))
+                return -EINVAL;
+
+        _cleanup_(sd_netlink_unrefp) sd_netlink *our_rtnl = NULL;
+        if (!rtnl)
+                rtnl = &our_rtnl;
+
+        /* If the requested name is already assigned as an alternative name, then first drop it. */
+        r = rtnl_get_link_alternative_names(rtnl, ifindex, &original_altnames);
+        if (r < 0)
+                log_debug_errno(r, "Failed to get alternative names on network interface %i, ignoring: %m",
+                                ifindex);
+
+        if (name) {
+                if (strv_contains(original_altnames, name)) {
+                        r = rtnl_delete_link_alternative_names(rtnl, ifindex, STRV_MAKE(name));
+                        if (r < 0)
+                                return log_debug_errno(r, "Failed to remove '%s' from alternative names on network interface %i: %m",
+                                                       name, ifindex);
+
+                        altname_deleted = true;
+                }
+
+                r = set_link_name(*rtnl, ifindex, name);
+                if (r < 0)
+                        goto fail;
+        }
+
+        /* Filter out already assigned names from requested alternative names. Also, dedup the request. */
+        STRV_FOREACH(a, alternative_names) {
+                if (streq_ptr(name, *a))
+                        continue;
+
+                if (strv_contains(original_altnames, *a))
+                        continue;
+
+                if (strv_contains(new_altnames, *a))
+                        continue;
+
+                if (!ifname_valid_full(*a, IFNAME_VALID_ALTERNATIVE))
+                        continue;
+
+                r = strv_extend(&new_altnames, *a);
+                if (r < 0)
+                        return r;
+        }
+
+        strv_sort(new_altnames);
+
+        /* Finally, assign alternative names. */
+        r = rtnl_set_link_alternative_names(rtnl, ifindex, new_altnames);
+        if (r == -EEXIST) /* Already assigned to another interface? */
+                STRV_FOREACH(a, new_altnames) {
+                        r = rtnl_set_link_alternative_names(rtnl, ifindex, STRV_MAKE(*a));
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to assign '%s' as an alternative name on network interface %i, ignoring: %m",
+                                                *a, ifindex);
+                }
+        else if (r < 0)
+                log_debug_errno(r, "Failed to assign alternative names on network interface %i, ignoring: %m", ifindex);
+
+        return 0;
+
+fail:
+        if (altname_deleted) {
+                int q = rtnl_set_link_alternative_names(rtnl, ifindex, STRV_MAKE(name));
+                if (q < 0)
+                        log_debug_errno(q, "Failed to restore '%s' as an alternative name on network interface %i, ignoring: %m",
+                                        name, ifindex);
+        }
+
+        return r;
+}
+
+int rtnl_set_link_properties(
+                sd_netlink **rtnl,
+                int ifindex,
+                const char *alias,
+                const struct hw_addr_data *hw_addr,
+                uint32_t txqueues,
+                uint32_t rxqueues,
+                uint32_t txqueuelen,
+                uint32_t mtu,
+                uint32_t gso_max_size,
+                size_t gso_max_segments) {
+
+        int r;
+
+        assert(ifindex > 0);
+
+        if (!alias &&
+            (!hw_addr || hw_addr->length == 0) &&
+            txqueues == 0 &&
+            rxqueues == 0 &&
+            txqueuelen == UINT32_MAX &&
+            mtu == 0 &&
+            gso_max_size == 0 &&
+            gso_max_segments == 0)
+                return 0;
+
+        _cleanup_(sd_netlink_unrefp) sd_netlink *our_rtnl = NULL;
+        if (!rtnl)
+                rtnl = &our_rtnl;
+        if (!*rtnl) {
+                r = sd_netlink_open(rtnl);
+                if (r < 0)
+                        return r;
+        }
+
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
         r = sd_rtnl_message_new_link(*rtnl, &message, RTM_SETLINK, ifindex);
         if (r < 0)
                 return r;
@@ -84,14 +329,44 @@ int rtnl_set_link_properties(sd_netlink **rtnl, int ifindex, const char *alias,
                         return r;
         }
 
-        if (mac) {
-                r = sd_netlink_message_append_ether_addr(message, IFLA_ADDRESS, mac);
+        if (hw_addr && hw_addr->length > 0) {
+                r = netlink_message_append_hw_addr(message, IFLA_ADDRESS, hw_addr);
+                if (r < 0)
+                        return r;
+        }
+
+        if (txqueues > 0) {
+                r = sd_netlink_message_append_u32(message, IFLA_NUM_TX_QUEUES, txqueues);
+                if (r < 0)
+                        return r;
+        }
+
+        if (rxqueues > 0) {
+                r = sd_netlink_message_append_u32(message, IFLA_NUM_RX_QUEUES, rxqueues);
+                if (r < 0)
+                        return r;
+        }
+
+        if (txqueuelen < UINT32_MAX) {
+                r = sd_netlink_message_append_u32(message, IFLA_TXQLEN, txqueuelen);
                 if (r < 0)
                         return r;
         }
 
         if (mtu != 0) {
                 r = sd_netlink_message_append_u32(message, IFLA_MTU, mtu);
+                if (r < 0)
+                        return r;
+        }
+
+        if (gso_max_size > 0) {
+                r = sd_netlink_message_append_u32(message, IFLA_GSO_MAX_SIZE, gso_max_size);
+                if (r < 0)
+                        return r;
+        }
+
+        if (gso_max_segments > 0) {
+                r = sd_netlink_message_append_u32(message, IFLA_GSO_MAX_SEGS, gso_max_segments);
                 if (r < 0)
                         return r;
         }
@@ -103,55 +378,30 @@ int rtnl_set_link_properties(sd_netlink **rtnl, int ifindex, const char *alias,
         return 0;
 }
 
-int rtnl_get_link_alternative_names(sd_netlink **rtnl, int ifindex, char ***ret) {
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL, *reply = NULL;
-        _cleanup_strv_free_ char **names = NULL;
+static int rtnl_update_link_alternative_names(
+                sd_netlink **rtnl,
+                uint16_t nlmsg_type,
+                int ifindex,
+                char* const *alternative_names) {
+
         int r;
 
-        assert(rtnl);
-        assert(ifindex > 0);
-        assert(ret);
-
-        if (!*rtnl) {
-                r = sd_netlink_open(rtnl);
-                if (r < 0)
-                        return r;
-        }
-
-        r = sd_rtnl_message_new_link(*rtnl, &message, RTM_GETLINK, ifindex);
-        if (r < 0)
-                return r;
-
-        r = sd_netlink_call(*rtnl, message, 0, &reply);
-        if (r < 0)
-                return r;
-
-        r = sd_netlink_message_read_strv(reply, IFLA_PROP_LIST, IFLA_ALT_IFNAME, &names);
-        if (r < 0 && r != -ENODATA)
-                return r;
-
-        *ret = TAKE_PTR(names);
-
-        return 0;
-}
-
-static int rtnl_update_link_alternative_names(sd_netlink **rtnl, uint16_t nlmsg_type, int ifindex, char * const *alternative_names) {
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
-        int r;
-
-        assert(rtnl);
         assert(ifindex > 0);
         assert(IN_SET(nlmsg_type, RTM_NEWLINKPROP, RTM_DELLINKPROP));
 
         if (strv_isempty(alternative_names))
                 return 0;
 
+        _cleanup_(sd_netlink_unrefp) sd_netlink *our_rtnl = NULL;
+        if (!rtnl)
+                rtnl = &our_rtnl;
         if (!*rtnl) {
                 r = sd_netlink_open(rtnl);
                 if (r < 0)
                         return r;
         }
 
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
         r = sd_rtnl_message_new_link(*rtnl, &message, nlmsg_type, ifindex);
         if (r < 0)
                 return r;
@@ -160,7 +410,7 @@ static int rtnl_update_link_alternative_names(sd_netlink **rtnl, uint16_t nlmsg_
         if (r < 0)
                 return r;
 
-        r = sd_netlink_message_append_strv(message, IFLA_ALT_IFNAME, alternative_names);
+        r = sd_netlink_message_append_strv(message, IFLA_ALT_IFNAME, (const char**) alternative_names);
         if (r < 0)
                 return r;
 
@@ -175,16 +425,19 @@ static int rtnl_update_link_alternative_names(sd_netlink **rtnl, uint16_t nlmsg_
         return 0;
 }
 
-int rtnl_set_link_alternative_names(sd_netlink **rtnl, int ifindex, char * const *alternative_names) {
+int rtnl_set_link_alternative_names(sd_netlink **rtnl, int ifindex, char* const *alternative_names) {
         return rtnl_update_link_alternative_names(rtnl, RTM_NEWLINKPROP, ifindex, alternative_names);
 }
 
-int rtnl_delete_link_alternative_names(sd_netlink **rtnl, int ifindex, char * const *alternative_names) {
+int rtnl_delete_link_alternative_names(sd_netlink **rtnl, int ifindex, char* const *alternative_names) {
         return rtnl_update_link_alternative_names(rtnl, RTM_DELLINKPROP, ifindex, alternative_names);
 }
 
-int rtnl_set_link_alternative_names_by_ifname(sd_netlink **rtnl, const char *ifname, char * const *alternative_names) {
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
+int rtnl_set_link_alternative_names_by_ifname(
+                sd_netlink **rtnl,
+                const char *ifname,
+                char* const *alternative_names) {
+
         int r;
 
         assert(rtnl);
@@ -193,12 +446,16 @@ int rtnl_set_link_alternative_names_by_ifname(sd_netlink **rtnl, const char *ifn
         if (strv_isempty(alternative_names))
                 return 0;
 
+        _cleanup_(sd_netlink_unrefp) sd_netlink *our_rtnl = NULL;
+        if (!rtnl)
+                rtnl = &our_rtnl;
         if (!*rtnl) {
                 r = sd_netlink_open(rtnl);
                 if (r < 0)
                         return r;
         }
 
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
         r = sd_rtnl_message_new_link(*rtnl, &message, RTM_NEWLINKPROP, 0);
         if (r < 0)
                 return r;
@@ -211,7 +468,7 @@ int rtnl_set_link_alternative_names_by_ifname(sd_netlink **rtnl, const char *ifn
         if (r < 0)
                 return r;
 
-        r = sd_netlink_message_append_strv(message, IFLA_ALT_IFNAME, alternative_names);
+        r = sd_netlink_message_append_strv(message, IFLA_ALT_IFNAME, (const char**) alternative_names);
         if (r < 0)
                 return r;
 
@@ -226,46 +483,30 @@ int rtnl_set_link_alternative_names_by_ifname(sd_netlink **rtnl, const char *ifn
         return 0;
 }
 
-int rtnl_resolve_link_alternative_name(sd_netlink **rtnl, const char *name) {
-        _cleanup_(sd_netlink_unrefp) sd_netlink *our_rtnl = NULL;
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL, *reply = NULL;
-        int r, ret;
+int rtnl_get_link_info_full(
+                sd_netlink **rtnl,
+                int ifindex,
+                char **ret_name,
+                char ***ret_altnames,
+                unsigned short *ret_iftype,
+                unsigned *ret_flags,
+                char **ret_kind,
+                struct hw_addr_data *ret_hw_addr,
+                struct hw_addr_data *ret_permanent_hw_addr) {
 
-        assert(name);
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL, *reply = NULL;
+        _cleanup_(sd_netlink_unrefp) sd_netlink *our_rtnl = NULL;
+        struct hw_addr_data addr = HW_ADDR_NULL, perm_addr = HW_ADDR_NULL;
+        _cleanup_free_ char *name = NULL, *kind = NULL;
+        _cleanup_strv_free_ char **altnames = NULL;
+        unsigned short iftype;
+        unsigned flags;
+        int r;
+
+        assert(ifindex > 0);
 
         if (!rtnl)
                 rtnl = &our_rtnl;
-        if (!*rtnl) {
-                r = sd_netlink_open(rtnl);
-                if (r < 0)
-                        return r;
-        }
-
-        r = sd_rtnl_message_new_link(*rtnl, &message, RTM_GETLINK, 0);
-        if (r < 0)
-                return r;
-
-        r = sd_netlink_message_append_string(message, IFLA_ALT_IFNAME, name);
-        if (r < 0)
-                return r;
-
-        r = sd_netlink_call(*rtnl, message, 0, &reply);
-        if (r == -EINVAL)
-                return -ENODEV; /* The device doesn't exist */
-        if (r < 0)
-                return r;
-
-        r = sd_rtnl_message_link_get_ifindex(reply, &ret);
-        if (r < 0)
-                return r;
-        assert(ret > 0);
-        return ret;
-}
-
-int rtnl_get_link_iftype(sd_netlink **rtnl, int ifindex, unsigned short *ret) {
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL, *reply = NULL;
-        int r;
-
         if (!*rtnl) {
                 r = sd_netlink_open(rtnl);
                 if (r < 0)
@@ -282,26 +523,64 @@ int rtnl_get_link_iftype(sd_netlink **rtnl, int ifindex, unsigned short *ret) {
         if (r < 0)
                 return r;
 
-        return sd_rtnl_message_link_get_type(reply, ret);
-}
-
-int rtnl_message_new_synthetic_error(sd_netlink *rtnl, int error, uint32_t serial, sd_netlink_message **ret) {
-        struct nlmsgerr *err;
-        int r;
-
-        assert(error <= 0);
-
-        r = message_new(rtnl, ret, NLMSG_ERROR);
+        r = parse_newlink_message(reply, ret_name ? &name : NULL, ret_altnames ? &altnames : NULL);
         if (r < 0)
                 return r;
+        if (r != ifindex)
+                return -EIO;
 
-        rtnl_message_seal(*ret);
-        (*ret)->hdr->nlmsg_seq = serial;
+        if (ret_iftype) {
+                r = sd_rtnl_message_link_get_type(reply, &iftype);
+                if (r < 0)
+                        return r;
+        }
 
-        err = NLMSG_DATA((*ret)->hdr);
-        err->error = error;
+        if (ret_flags) {
+                r = sd_rtnl_message_link_get_flags(reply, &flags);
+                if (r < 0)
+                        return r;
+        }
 
-        return 0;
+        if (ret_kind) {
+                r = sd_netlink_message_enter_container(reply, IFLA_LINKINFO);
+                if (r >= 0) {
+                        r = sd_netlink_message_read_string_strdup(reply, IFLA_INFO_KIND, &kind);
+                        if (r < 0 && r != -ENODATA)
+                                return r;
+
+                        r = sd_netlink_message_exit_container(reply);
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        if (ret_hw_addr) {
+                r = netlink_message_read_hw_addr(reply, IFLA_ADDRESS, &addr);
+                if (r < 0 && r != -ENODATA)
+                        return r;
+        }
+
+        if (ret_permanent_hw_addr) {
+                r = netlink_message_read_hw_addr(reply, IFLA_PERM_ADDRESS, &perm_addr);
+                if (r < 0 && r != -ENODATA)
+                        return r;
+        }
+
+        if (ret_name)
+                *ret_name = TAKE_PTR(name);
+        if (ret_altnames)
+                *ret_altnames = TAKE_PTR(altnames);
+        if (ret_iftype)
+                *ret_iftype = iftype;
+        if (ret_flags)
+                *ret_flags = flags;
+        if (ret_kind)
+                *ret_kind = TAKE_PTR(kind);
+        if (ret_hw_addr)
+                *ret_hw_addr = addr;
+        if (ret_permanent_hw_addr)
+                *ret_permanent_hw_addr = perm_addr;
+        return ifindex;
 }
 
 int rtnl_log_parse_error(int r) {
@@ -369,79 +648,129 @@ int rtattr_append_attribute(struct rtattr **rta, unsigned short type, const void
         return 0;
 }
 
-int rtattr_read_nexthop(const struct rtnexthop *rtnh, size_t size, int family, OrderedSet **ret) {
-        _cleanup_ordered_set_free_free_ OrderedSet *set = NULL;
+bool netlink_pid_changed(sd_netlink *nl) {
+        /* We don't support people creating an nl connection and
+         * keeping it around over a fork(). Let's complain. */
+        return ASSERT_PTR(nl)->original_pid != getpid_cached();
+}
+
+static int socket_open(int family) {
+        int fd;
+
+        fd = socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC|SOCK_NONBLOCK, family);
+        if (fd < 0)
+                return -errno;
+
+        return fd_move_above_stdio(fd);
+}
+
+int netlink_open_family(sd_netlink **ret, int family) {
+        _cleanup_close_ int fd = -EBADF;
         int r;
 
-        assert(rtnh);
-        assert(IN_SET(family, AF_INET, AF_INET6));
+        fd = socket_open(family);
+        if (fd < 0)
+                return fd;
 
-        if (size < sizeof(struct rtnexthop))
-                return -EBADMSG;
+        r = sd_netlink_open_fd(ret, fd);
+        if (r < 0)
+                return r;
+        TAKE_FD(fd);
 
-        for (; size >= sizeof(struct rtnexthop); ) {
-                _cleanup_free_ MultipathRoute *m = NULL;
+        return 0;
+}
 
-                if (NLMSG_ALIGN(rtnh->rtnh_len) > size)
-                        return -EBADMSG;
+static bool serial_used(sd_netlink *nl, uint32_t serial) {
+        assert(nl);
 
-                if (rtnh->rtnh_len < sizeof(struct rtnexthop))
-                        return -EBADMSG;
+        return
+                hashmap_contains(nl->reply_callbacks, UINT32_TO_PTR(serial)) ||
+                hashmap_contains(nl->rqueue_by_serial, UINT32_TO_PTR(serial)) ||
+                hashmap_contains(nl->rqueue_partial_by_serial, UINT32_TO_PTR(serial));
+}
 
-                m = new(MultipathRoute, 1);
-                if (!m)
-                        return -ENOMEM;
+void netlink_seal_message(sd_netlink *nl, sd_netlink_message *m) {
+        uint32_t picked;
 
-                *m = (MultipathRoute) {
-                        .ifindex = rtnh->rtnh_ifindex,
-                        .weight = rtnh->rtnh_hops == 0 ? 0 : rtnh->rtnh_hops + 1,
-                };
+        assert(nl);
+        assert(!netlink_pid_changed(nl));
+        assert(m);
+        assert(m->hdr);
 
-                if (rtnh->rtnh_len > sizeof(struct rtnexthop)) {
-                        size_t len = rtnh->rtnh_len - sizeof(struct rtnexthop);
+        /* Avoid collisions with outstanding requests */
+        do {
+                picked = nl->serial;
 
-                        for (struct rtattr *attr = RTNH_DATA(rtnh); RTA_OK(attr, len); attr = RTA_NEXT(attr, len)) {
-                                if (attr->rta_type == RTA_GATEWAY) {
-                                        if (attr->rta_len != RTA_LENGTH(FAMILY_ADDRESS_SIZE(family)))
-                                                return -EBADMSG;
+                /* Don't use seq == 0, as that is used for broadcasts, so we would get confused by replies to
+                   such messages */
+                nl->serial = nl->serial == UINT32_MAX ? 1 : nl->serial + 1;
 
-                                        m->gateway.family = family;
-                                        memcpy(&m->gateway.address, RTA_DATA(attr), FAMILY_ADDRESS_SIZE(family));
-                                        break;
-                                } else if (attr->rta_type == RTA_VIA) {
-                                        uint16_t gw_family;
+        } while (serial_used(nl, picked));
 
-                                        if (family != AF_INET)
-                                                return -EINVAL;
+        m->hdr->nlmsg_seq = picked;
+        message_seal(m);
+}
 
-                                        if (attr->rta_len < RTA_LENGTH(sizeof(uint16_t)))
-                                                return -EBADMSG;
+static int socket_writev_message(sd_netlink *nl, sd_netlink_message **m, size_t msgcount) {
+        _cleanup_free_ struct iovec *iovs = NULL;
+        ssize_t k;
 
-                                        gw_family = *(uint16_t *) RTA_DATA(attr);
+        assert(nl);
+        assert(m);
+        assert(msgcount > 0);
 
-                                        if (gw_family != AF_INET6)
-                                                return -EBADMSG;
+        iovs = new(struct iovec, msgcount);
+        if (!iovs)
+                return -ENOMEM;
 
-                                        if (attr->rta_len != RTA_LENGTH(FAMILY_ADDRESS_SIZE(gw_family) + sizeof(gw_family)))
-                                                return -EBADMSG;
+        for (size_t i = 0; i < msgcount; i++) {
+                assert(m[i]->hdr);
+                assert(m[i]->hdr->nlmsg_len > 0);
 
-                                        memcpy(&m->gateway, RTA_DATA(attr), FAMILY_ADDRESS_SIZE(gw_family) + sizeof(gw_family));
-                                        break;
-                                }
-                        }
-                }
-
-                r = ordered_set_ensure_put(&set, NULL, m);
-                if (r < 0)
-                        return r;
-
-                TAKE_PTR(m);
-
-                size -= NLMSG_ALIGN(rtnh->rtnh_len);
-                rtnh = RTNH_NEXT(rtnh);
+                iovs[i] = IOVEC_MAKE(m[i]->hdr, m[i]->hdr->nlmsg_len);
         }
 
-        if (ret)
-                *ret = TAKE_PTR(set);
-        return 0;
+        k = writev(nl->fd, iovs, msgcount);
+        if (k < 0)
+                return -errno;
+
+        return k;
+}
+
+int sd_netlink_sendv(
+                sd_netlink *nl,
+                sd_netlink_message **messages,
+                size_t msgcount,
+                uint32_t **ret_serial) {
+
+        _cleanup_free_ uint32_t *serials = NULL;
+        int r;
+
+        assert_return(nl, -EINVAL);
+        assert_return(!netlink_pid_changed(nl), -ECHILD);
+        assert_return(messages, -EINVAL);
+        assert_return(msgcount > 0, -EINVAL);
+
+        if (ret_serial) {
+                serials = new(uint32_t, msgcount);
+                if (!serials)
+                        return -ENOMEM;
+        }
+
+        for (size_t i = 0; i < msgcount; i++) {
+                assert_return(!messages[i]->sealed, -EPERM);
+
+                netlink_seal_message(nl, messages[i]);
+                if (serials)
+                        serials[i] = message_get_serial(messages[i]);
+        }
+
+        r = socket_writev_message(nl, messages, msgcount);
+        if (r < 0)
+                return r;
+
+        if (ret_serial)
+                *ret_serial = TAKE_PTR(serials);
+
+        return r;
 }

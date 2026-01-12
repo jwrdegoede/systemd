@@ -22,12 +22,16 @@ Wants=time-set.target
 AmbientCapabilities=CAP_SYS_TIME
 BusName=org.freedesktop.timesync1
 CapabilityBoundingSet=CAP_SYS_TIME
-ExecStart=!!@rootlibexecdir@/systemd-timesyncd
+# Turn off DNSSEC validation for hostname look-ups, since those need the
+# correct time to work, but we likely won't acquire that without NTP. Let's
+# break this chicken-and-egg cycle here.
+Environment=SYSTEMD_NSS_RESOLVE_VALIDATE=0
+ExecStart={{LIBEXECDIR}}/systemd-timesyncd
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 NoNewPrivileges=yes
 PrivateDevices=yes
-PrivateTmp=yes
+PrivateTmp=disconnected
 ProtectProc=invisible
 ProtectControlGroups=yes
 ProtectHome=yes
@@ -49,7 +53,7 @@ SystemCallErrorNumber=EPERM
 SystemCallFilter=@system-service @clock
 Type=notify
 User=systemd-timesync
-@SERVICE_WATCHDOG@
+{{SERVICE_WATCHDOG}}
 
 [Install]
 WantedBy=sysinit.target

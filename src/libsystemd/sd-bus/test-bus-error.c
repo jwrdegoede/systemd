@@ -2,19 +2,21 @@
 
 #include "sd-bus.h"
 
+#include "alloc-util.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
-#include "bus-util.h"
 #include "errno-list.h"
 #include "errno-util.h"
+#include "string-util.h"
+#include "tests.h"
 
-static void test_error(void) {
+TEST(error) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL, second = SD_BUS_ERROR_NULL;
         const sd_bus_error const_error = SD_BUS_ERROR_MAKE_CONST(SD_BUS_ERROR_FILE_EXISTS, "const error");
         const sd_bus_error temporarily_const_error = {
                 .name = SD_BUS_ERROR_ACCESS_DENIED,
                 .message = "oh! no",
-                ._need_free = -1
+                ._need_free = -1,
         };
 
         assert_se(!sd_bus_error_is_set(&error));
@@ -97,7 +99,7 @@ static void test_error(void) {
         assert_se(!sd_bus_error_is_set(&error));
         assert_se(sd_bus_error_set_errno(&error, EBUSY) == -EBUSY);
         assert_se(streq(error.name, "System.Error.EBUSY"));
-        assert_se(streq(error.message, strerror_safe(EBUSY)));
+        assert_se(streq(error.message, STRERROR(EBUSY)));
         assert_se(sd_bus_error_has_name(&error, "System.Error.EBUSY"));
         assert_se(sd_bus_error_get_errno(&error) == EBUSY);
         assert_se(sd_bus_error_is_set(&error));
@@ -125,25 +127,27 @@ static void test_error(void) {
 extern const sd_bus_error_map __start_SYSTEMD_BUS_ERROR_MAP[];
 extern const sd_bus_error_map __stop_SYSTEMD_BUS_ERROR_MAP[];
 
-static void dump_mapping_table(void) {
+static int dump_mapping_table(void) {
         const sd_bus_error_map *m;
 
         printf("----- errno mappings ------\n");
-        m = ALIGN_TO_PTR(__start_SYSTEMD_BUS_ERROR_MAP, sizeof(void*));
+        m = ALIGN_PTR(__start_SYSTEMD_BUS_ERROR_MAP);
         while (m < __stop_SYSTEMD_BUS_ERROR_MAP) {
 
                 if (m->code == BUS_ERROR_MAP_END_MARKER) {
-                        m = ALIGN_TO_PTR(m + 1, sizeof(void*));
+                        m = ALIGN_PTR(m + 1);
                         continue;
                 }
 
-                printf("%s -> %i/%s\n", strna(m->name), m->code, strna(errno_to_name(m->code)));
+                printf("%s -> %i/%s\n", strna(m->name), m->code, ERRNO_NAME(m->code));
                 m++;
         }
         printf("---------------------------\n");
+
+        return EXIT_SUCCESS;
 }
 
-static void test_errno_mapping_standard(void) {
+TEST(errno_mapping_standard) {
         assert_se(sd_bus_error_set(NULL, "System.Error.EUCLEAN", NULL) == -EUCLEAN);
         assert_se(sd_bus_error_set(NULL, "System.Error.EBUSY", NULL) == -EBUSY);
         assert_se(sd_bus_error_set(NULL, "System.Error.EINVAL", NULL) == -EINVAL);
@@ -185,7 +189,7 @@ static const sd_bus_error_map test_errors_bad2[] = {
         SD_BUS_ERROR_MAP_END
 };
 
-static void test_errno_mapping_custom(void) {
+TEST(errno_mapping_custom) {
         assert_se(sd_bus_error_set(NULL, "org.freedesktop.custom-dbus-error", NULL) == -5);
         assert_se(sd_bus_error_set(NULL, "org.freedesktop.custom-dbus-error-2", NULL) == -52);
         assert_se(sd_bus_error_set(NULL, "org.freedesktop.custom-dbus-error-x", NULL) == -EIO);
@@ -209,11 +213,11 @@ static void test_errno_mapping_custom(void) {
 
         assert_se(sd_bus_error_set(NULL, BUS_ERROR_NO_SUCH_UNIT, NULL) == -ENOENT);
 
-        assert_se(sd_bus_error_add_map(test_errors_bad1) == -EINVAL);
-        assert_se(sd_bus_error_add_map(test_errors_bad2) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_bus_error_add_map(test_errors_bad1) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_bus_error_add_map(test_errors_bad2) == -EINVAL);
 }
 
-static void test_sd_bus_error_set_errnof(void) {
+TEST(sd_bus_error_set_errnof) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_free_ char *str = NULL;
 
@@ -225,30 +229,21 @@ static void test_sd_bus_error_set_errnof(void) {
 
         assert_se(sd_bus_error_set_errnof(&error, EACCES, NULL) == -EACCES);
         assert_se(sd_bus_error_has_name(&error, SD_BUS_ERROR_ACCESS_DENIED));
-        errno = EACCES;
-        assert_se(asprintf(&str, "%m") >= 0);
-        assert_se(streq(error.message, str));
-        assert_se(error._need_free == 0);
+        ASSERT_STREQ(error.message, STRERROR(EACCES));
 
         str = mfree(str);
         sd_bus_error_free(&error);
 
         assert_se(sd_bus_error_set_errnof(&error, ENOANO, NULL) == -ENOANO);
         assert_se(sd_bus_error_has_name(&error, "System.Error.ENOANO"));
-        errno = ENOANO;
-        assert_se(asprintf(&str, "%m") >= 0);
-        assert_se(streq(error.message, str));
-        assert_se(error._need_free == 1);
+        ASSERT_STREQ(error.message, STRERROR(ENOANO));
 
         str = mfree(str);
         sd_bus_error_free(&error);
 
         assert_se(sd_bus_error_set_errnof(&error, 100000, NULL) == -100000);
         assert_se(sd_bus_error_has_name(&error, SD_BUS_ERROR_FAILED));
-        errno = 100000;
-        assert_se(asprintf(&str, "%m") >= 0);
-        assert_se(streq(error.message, str));
-        assert_se(error._need_free == 1);
+        ASSERT_STREQ(error.message, STRERROR(100000));
 
         str = mfree(str);
         sd_bus_error_free(&error);
@@ -264,7 +259,6 @@ static void test_sd_bus_error_set_errnof(void) {
         errno = EACCES;
         assert_se(asprintf(&str, "hoge %s: %m", "foo") >= 0);
         assert_se(streq(error.message, str));
-        assert_se(error._need_free == 1);
 
         str = mfree(str);
         sd_bus_error_free(&error);
@@ -274,7 +268,6 @@ static void test_sd_bus_error_set_errnof(void) {
         errno = ENOANO;
         assert_se(asprintf(&str, "hoge %s: %m", "foo") >= 0);
         assert_se(streq(error.message, str));
-        assert_se(error._need_free == 1);
 
         str = mfree(str);
         sd_bus_error_free(&error);
@@ -284,16 +277,6 @@ static void test_sd_bus_error_set_errnof(void) {
         errno = 100000;
         assert_se(asprintf(&str, "hoge %s: %m", "foo") >= 0);
         assert_se(streq(error.message, str));
-        assert_se(error._need_free == 1);
 }
 
-int main(int argc, char *argv[]) {
-        dump_mapping_table();
-
-        test_error();
-        test_errno_mapping_standard();
-        test_errno_mapping_custom();
-        test_sd_bus_error_set_errnof();
-
-        return 0;
-}
+DEFINE_TEST_MAIN_WITH_INTRO(LOG_INFO, dump_mapping_table);

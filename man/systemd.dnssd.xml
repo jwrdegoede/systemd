@@ -1,6 +1,6 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd.dnssd"
@@ -41,7 +41,7 @@
     <filename>/usr/local/lib/systemd/dnssd</filename>, the volatile runtime network directory
     <filename>/run/systemd/dnssd</filename> and the local administration network directory
     <filename>/etc/systemd/dnssd</filename>. All configuration files are collectively sorted and processed in
-    lexical order, regardless of the directories in which they live. However, files with identical filenames
+    lexicographic order, regardless of the directories in which they live. However, files with identical filenames
     replace each other. Files in <filename>/etc/</filename> have the highest priority, files in
     <filename>/run/</filename> take precedence over files with the same name in
     <filename>/usr/lib/</filename>. This can be used to override a system-supplied configuration file with a
@@ -90,10 +90,12 @@
                 </thead>
                 <tbody>
                   <xi:include href="standard-specifiers.xml" xpointer="a"/>
+                  <xi:include href="standard-specifiers.xml" xpointer="A"/>
                   <xi:include href="standard-specifiers.xml" xpointer="b"/>
                   <xi:include href="standard-specifiers.xml" xpointer="B"/>
                   <xi:include href="standard-specifiers.xml" xpointer="H"/>
                   <xi:include href="standard-specifiers.xml" xpointer="m"/>
+                  <xi:include href="standard-specifiers.xml" xpointer="M"/>
                   <xi:include href="standard-specifiers.xml" xpointer="o"/>
                   <xi:include href="standard-specifiers.xml" xpointer="v"/>
                   <xi:include href="standard-specifiers.xml" xpointer="w"/>
@@ -102,6 +104,8 @@
                 </tbody>
               </tgroup>
             </table>
+
+              <xi:include href="version-info.xml" xpointer="v236"/>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -110,24 +114,44 @@
             <para>A type of the network service as defined in the section 4.1.2 of <ulink
             url="https://tools.ietf.org/html/rfc6763">RFC 6763</ulink>, e.g. <literal>_http._tcp</literal>.
             </para>
+
+          <xi:include href="version-info.xml" xpointer="v236"/>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term><varname>SubType=</varname></term>
+          <listitem>
+            <para>A subtype of the network service as defined in the section 7.1 of <ulink
+            url="https://tools.ietf.org/html/rfc6763">RFC 6763</ulink>, e.g. <literal>_printer</literal>.
+            </para>
+
+          <xi:include href="version-info.xml" xpointer="v256"/>
           </listitem>
         </varlistentry>
         <varlistentry>
           <term><varname>Port=</varname></term>
           <listitem>
             <para>An IP port number of the network service.</para>
+
+          <xi:include href="version-info.xml" xpointer="v236"/>
           </listitem>
         </varlistentry>
         <varlistentry>
           <term><varname>Priority=</varname></term>
           <listitem>
-            <para>A priority number set in SRV resource records corresponding to the network service.</para>
+            <para>A priority number set in <constant class='dns'>SRV</constant> resource records corresponding
+            to the network service.</para>
+
+          <xi:include href="version-info.xml" xpointer="v236"/>
           </listitem>
         </varlistentry>
         <varlistentry>
           <term><varname>Weight=</varname></term>
           <listitem>
-            <para>A weight number set in SRV resource records corresponding to the network service.</para>
+            <para>A weight number set in <constant class='dns'>SRV</constant> resource records corresponding
+            to the network service.</para>
+
+          <xi:include href="version-info.xml" xpointer="v236"/>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -142,6 +166,8 @@
             case multiple TXT resource records will be created for the service. If the empty string is assigned to
             this option, the list is reset and all prior assignments will have no effect.
             </para>
+
+            <xi:include href="version-info.xml" xpointer="v236"/>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -157,6 +183,8 @@
             case multiple TXT resource records will be created for the service. If the empty string is assigned to
             this option, the list is reset and all prior assignments will have no effect.
             </para>
+
+            <xi:include href="version-info.xml" xpointer="v236"/>
           </listitem>
         </varlistentry>
       </variablelist>
@@ -213,11 +241,11 @@ meteo._http._tcp.local: meteo.local:80 [priority=0, weight=0]
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-resolved.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>resolvectl</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-resolved.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>resolvectl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

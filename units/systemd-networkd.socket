@@ -8,15 +8,17 @@
 #  (at your option) any later version.
 
 [Unit]
-Description=Network Service Netlink Socket
+Description=Network Management Netlink Socket
 Documentation=man:systemd-networkd.service(8) man:rtnetlink(7)
 ConditionCapability=CAP_NET_ADMIN
 DefaultDependencies=no
-Before=sockets.target
+Before=sockets.target shutdown.target
+Conflicts=shutdown.target
 
 [Socket]
 ReceiveBuffer=128M
 ListenNetlink=route 1361
+FileDescriptorName=rtnl
 PassPacketInfo=yes
 
 [Install]

@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "conf-parser.h"
+#include "networkd-forward.h"
 
-typedef struct Link Link;
+void network_adjust_ipv6_proxy_ndp(Network *network);
 
-int link_set_ipv6_proxy_ndp_addresses(Link *link);
+int link_request_static_ipv6_proxy_ndp_addresses(Link *link);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_ipv6_proxy_ndp_address);

@@ -1,17 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-
 #include "sd-device.h"
 
 #include "alloc-util.h"
 #include "device-enumerator-private.h"
-#include "locale-util.h"
+#include "device-util.h"
+#include "glyph-util.h"
 #include "path-util.h"
 #include "string-util.h"
 #include "sysfs-show.h"
 #include "terminal-util.h"
-#include "util.h"
 
 static int show_sysfs_one(
                 const char *seat,
@@ -32,7 +30,7 @@ static int show_sysfs_one(
         assert(prefix);
 
         if (flags & OUTPUT_FULL_WIDTH)
-                max_width = (size_t) -1;
+                max_width = SIZE_MAX;
         else if (n_columns < 10)
                 max_width = 10;
         else
@@ -48,8 +46,9 @@ static int show_sysfs_one(
                     !path_startswith(sysfs, sub))
                         return 0;
 
-                if (sd_device_get_property_value(dev_list[*i_dev], "ID_SEAT", &sn) < 0 || isempty(sn))
-                        sn = "seat0";
+                r = device_get_seat(dev_list[*i_dev], &sn);
+                if (r < 0)
+                        return r;
 
                 /* Explicitly also check for tag 'seat' here */
                 if (!streq(seat, sn) ||
@@ -76,9 +75,9 @@ static int show_sysfs_one(
                             !path_startswith(lookahead_sysfs, sysfs)) {
                                 const char *lookahead_sn;
 
-                                if (sd_device_get_property_value(dev_list[lookahead], "ID_SEAT", &lookahead_sn) < 0 ||
-                                    isempty(lookahead_sn))
-                                        lookahead_sn = "seat0";
+                                r = device_get_seat(dev_list[lookahead], &lookahead_sn);
+                                if (r < 0)
+                                        return r;
 
                                 if (streq(seat, lookahead_sn) && sd_device_has_current_tag(dev_list[lookahead], "seat") > 0)
                                         break;
@@ -89,7 +88,7 @@ static int show_sysfs_one(
                 if (!k)
                         return -ENOMEM;
 
-                printf("%s%s%s\n", prefix, special_glyph(lookahead < n_dev ? SPECIAL_GLYPH_TREE_BRANCH : SPECIAL_GLYPH_TREE_RIGHT), k);
+                printf("%s%s%s\n", prefix, glyph(lookahead < n_dev ? GLYPH_TREE_BRANCH : GLYPH_TREE_RIGHT), k);
 
                 if (asprintf(&l,
                              "%s%s:%s%s%s%s",
@@ -103,17 +102,17 @@ static int show_sysfs_one(
                 if (!k)
                         return -ENOMEM;
 
-                printf("%s%s%s\n", prefix, lookahead < n_dev ? special_glyph(SPECIAL_GLYPH_TREE_VERTICAL) : "  ", k);
+                printf("%s%s%s\n", prefix, lookahead < n_dev ? glyph(GLYPH_TREE_VERTICAL) : "  ", k);
 
                 if (++(*i_dev) < n_dev) {
                         _cleanup_free_ char *p = NULL;
 
-                        p = strjoin(prefix, lookahead < n_dev ? special_glyph(SPECIAL_GLYPH_TREE_VERTICAL) : "  ");
+                        p = strjoin(prefix, lookahead < n_dev ? glyph(GLYPH_TREE_VERTICAL) : "  ");
                         if (!p)
                                 return -ENOMEM;
 
                         r = show_sysfs_one(seat, dev_list, i_dev, n_dev, sysfs, p,
-                                           n_columns == (unsigned) -1 || n_columns < 2 ? n_columns : n_columns - 2,
+                                           n_columns == UINT_MAX || n_columns < 2 ? n_columns : n_columns - 2,
                                            flags);
                         if (r < 0)
                                 return r;
@@ -159,7 +158,7 @@ int show_sysfs(const char *seat, const char *prefix, unsigned n_columns, OutputF
         if (dev_list && n_dev > 0)
                 show_sysfs_one(seat, dev_list, &i, n_dev, "/", prefix, n_columns, flags);
         else
-                printf("%s%s%s\n", prefix, special_glyph(SPECIAL_GLYPH_TREE_RIGHT), "(none)");
+                printf("%s%s%s\n", prefix, glyph(GLYPH_TREE_RIGHT), "(none)");
 
         return 0;
 }
